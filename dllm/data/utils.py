@@ -15,7 +15,9 @@ logger = get_default_logger(__name__)
 
 
 def load_sft_dataset(
-    dataset_args: str, load_preprocessed_data: bool = False
+    dataset_args: str,
+    load_preprocessed_data: bool = False,
+    filter_correct_only: bool = False,
 ) -> DatasetDict:
     """
     Examples of dataset_args:
@@ -25,6 +27,7 @@ def load_sft_dataset(
       - "tatsu-lab/alpaca[train:5000] + HuggingFaceH4/ultrachat_200k[train:5000]"
     """
     from dllm.data.alpaca import load_dataset_alpaca
+    from dllm.data.math_eval import load_dataset_gsm8k, load_dataset_math500
     from dllm.data.opc import load_dataset_opc_sft
 
     specs = [p.strip() for p in re.split(r"[|+]", dataset_args) if p.strip()]
@@ -58,12 +61,19 @@ def load_sft_dataset(
         elif _match(dataset_name_or_path, "HuggingFaceH4/ultrachat_200k"):
             ds = load_dataset(dataset_name_or_path)
             ds = DatasetDict({"train": ds["train_sft"], "test": ds["test_sft"]})
+        elif _match(dataset_name_or_path, "openai/gsm8k"):
+            name = kvs.pop("name", "main")
+            ds = load_dataset_gsm8k(dataset_name_or_path, name=name)
+        elif _match(dataset_name_or_path, "HuggingFaceH4/MATH-500"):
+            ds = load_dataset_math500(dataset_name_or_path)
         else:
             ds = load_dataset(dataset_name_or_path)
 
         # Normalize to DatasetDict and apply per-split limits
         ds = _ensure_datasetdict(ds)
         ds = _truncate_datasetdict(ds, kvs)
+        if filter_correct_only:
+            ds = _filter_datasetdict_correct_only(ds, dataset_name_or_path)
         all_parts.append(ds)
 
     # If only one part, return as DatasetDict
@@ -75,6 +85,59 @@ def load_sft_dataset(
     for part in all_parts[1:]:
         merged = _merge_datasetdicts(merged, part)
     return _ensure_datasetdict(merged)
+
+
+def _is_correct_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _filter_datasetdict_correct_only(ds: DatasetDict, dataset_name_or_path: str) -> DatasetDict:
+    out = {}
+    has_is_correct = False
+    total_before = 0
+    total_after = 0
+
+    for split, split_ds in ds.items():
+        total_before += len(split_ds)
+        if "is_correct" in split_ds.column_names:
+            has_is_correct = True
+            filtered_split = split_ds.filter(
+                lambda row: _is_correct_value(row.get("is_correct")),
+                desc=f"Filtering {split} split on is_correct==1",
+            )
+            out[split] = filtered_split
+        else:
+            out[split] = split_ds
+        total_after += len(out[split])
+
+    if not has_is_correct:
+        raise ValueError(
+            "filter_correct_only=True but no 'is_correct' column was found "
+            f"in dataset '{dataset_name_or_path}'."
+        )
+
+    if total_after == 0:
+        raise ValueError(
+            "All rows were removed by is_correct==1 filtering for dataset "
+            f"'{dataset_name_or_path}'."
+        )
+
+    logger.info(
+        "Applied correct-only filter to '%s': %d -> %d rows (%.2f%% kept)",
+        dataset_name_or_path,
+        total_before,
+        total_after,
+        100.0 * total_after / max(total_before, 1),
+    )
+    return DatasetDict(out)
 
 
 def load_pt_dataset(

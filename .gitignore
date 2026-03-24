@@ -133,7 +133,9 @@ dmypy.json
 # Others
 /.vscode/
 /tmp/
-/.data/
+/data/
 /wandb/
-/.logs/
-/.models/
+/logs/
+/models/
+AGENTS.md
+/scripts/

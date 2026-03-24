@@ -2,18 +2,18 @@
 #SBATCH --job-name=dllm
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --partition=mllm_safety
-#SBATCH --quotatype=spot
-#SBATCH --output=./.logs/%x-%j.out
-#SBATCH --err=./.logs/%x-%j.err
+#SBATCH --partition=2xlong
+#SBATCH --output=./logs/%x-%j.out
+#SBATCH --err=./logs/%x-%j.err
 #SBATCH --requeue
-#SBATCH --time=3-00:00:00
+#SBATCH --time=08:00:00
 
 # ===== Cluster variables =====
 NUM_NODES=${SLURM_NNODES}
-GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+# Use Slurm's native GPU count variable, fallback to 8 just in case
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
 WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
 NODELIST=($(scontrol show hostnames "${SLURM_JOB_NODELIST}"))
 MASTER_ADDR=${NODELIST[0]}
@@ -38,6 +38,19 @@ echo "============================"
 # ===== Environment =====
 export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTHONPATH=.
+# ===== Environment =====
+export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTHONPATH=.
+
+# Redirect Triton and Hugging Face caches to your scratch space
+export TRITON_CACHE_DIR="/scratch/user/atharvchagi_tamu.edu/.triton_cache"
+export HF_HOME="/scratch/user/atharvchagi_tamu.edu/.cache/huggingface"
+
+# Create the folder so Triton doesn't panic
+mkdir -p $TRITON_CACHE_DIR
+mkdir -p $HF_HOME
+
+
 
 # ===== Default options =====
 accelerate_config="zero2"

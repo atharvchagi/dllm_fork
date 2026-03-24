@@ -105,6 +105,7 @@ class BaseEvalHarness(LM):
             self.accelerator = None
 
         self.batch_size = int(kwargs.get("batch_size", eval_config.batch_size))
+        self.enable_thinking = kwargs.get("enable_thinking", None)
 
     @property
     def rank(self) -> int:
@@ -124,11 +125,16 @@ class BaseEvalHarness(LM):
         add_generation_prompt: bool = True,
     ) -> str:
         """Format chat history for input to the LM."""
+        template_kwargs = {}
+        if self.enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self.enable_thinking
+
         return self.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=not add_generation_prompt,
+            **template_kwargs,
         )
 
     # ── Unified generate_until scaffolding ────────────────────────────

@@ -50,7 +50,14 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
+try:
+    # Older transformers versions expose this in import_utils.
+    from transformers.utils.import_utils import is_torch_fx_available
+except ImportError:
+    # Newer versions may not export the helper; use a minimal equivalent.
+    def is_torch_fx_available() -> bool:
+        return hasattr(torch, "fx")
+
 from .configuration_llada2_moe import LLaDA2MoeConfig
 from transformers.generation.utils import GenerationMixin
 

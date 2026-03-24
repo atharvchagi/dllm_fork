@@ -31,6 +31,7 @@ class ScriptArguments:
     mask_prompt_loss: bool = True  # Mask prompt tokens in labels with -100
     num_proc: int = 32
     remove_columns: bool = False
+    filter_correct_only: bool = False
 
     def __post_init__(self):
         self.model_name_or_path = dllm.utils.resolve_with_base_env(
@@ -81,7 +82,10 @@ def main():
     tokenizer = dllm.utils.get_tokenizer(args)
 
     # Load your raw dataset (must contain a "messages" field per example).
-    dataset = dllm.data.load_sft_dataset(args.dataset_args)
+    dataset = dllm.data.load_sft_dataset(
+        args.dataset_args,
+        filter_correct_only=args.filter_correct_only,
+    )
 
     # 4. Dynamically import the function based on the argument
     try:
