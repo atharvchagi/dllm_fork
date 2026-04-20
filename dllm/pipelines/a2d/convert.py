@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import os
+import shutil
 
 import transformers
 import tyro
@@ -24,7 +26,37 @@ class ScriptArguments:
         )
 
 
+def _normalize_cuda_home() -> None:
+    """Ensure CUDA_HOME points to a valid toolkit to avoid DeepSpeed nvcc lookup errors."""
+    cuda_home = os.environ.get("CUDA_HOME", "").strip()
+    if cuda_home and os.path.isfile(os.path.join(cuda_home, "bin", "nvcc")):
+        return
+
+    if cuda_home:
+        os.environ.pop("CUDA_HOME", None)
+
+    candidates: list[str] = []
+    conda_prefix = os.environ.get("CONDA_PREFIX", "").strip()
+    if conda_prefix:
+        candidates.append(conda_prefix)
+    candidates.extend([
+        "/usr/local/cuda",
+        "/usr/local/cuda-12.9",
+        "/usr/local/cuda-12",
+    ])
+
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "bin", "nvcc")):
+            os.environ["CUDA_HOME"] = candidate
+            return
+
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path:
+        os.environ["CUDA_HOME"] = os.path.dirname(os.path.dirname(nvcc_path))
+
+
 def main():
+    _normalize_cuda_home()
 
     args = tyro.cli(ScriptArguments)
     dllm.utils.print_args(args)

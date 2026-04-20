@@ -95,30 +95,22 @@ class BD3LMTrainer(MDLMTrainer):
         *pargs,
         **kwargs,
     ):
+        if args.loss_type == "CE+KL":
+            raise ValueError(
+                "BD3LMTrainer does not support loss_type='CE+KL'. Use 'CE' or 'KL'."
+            )
         super().__init__(args=args, *pargs, **kwargs)
         self.block_size = args.block_size
+        # BD3LM intentionally supports CE and KL only.
+        self.loss_type_dict = {
+            "CE": self.compute_CE_loss,
+            "KL": self.compute_KL_loss,
+        }
 
-    def compute_loss(
+    def _prepare_diffusion_batch(
         self,
-        model: transformers.PreTrainedModel | nn.Module,
-        inputs: list[dict[str, Any]],
-        return_outputs: bool = False,
-        **kwargs,
-    ):
-        """
-        Compute the block diffusion language modeling loss.
-
-        Applies block-wise diffusion with specialized attention masks where the model
-        attends to both noised blocks (x_t) and clean context blocks (x_0).
-
-        Args:
-            model: The language model to train.
-            inputs: Dictionary containing input_ids, labels, and optionally attention_mask.
-            return_outputs: If True, return both loss and model outputs.
-
-        Returns:
-            Loss tensor, or tuple of (loss, outputs) if return_outputs is True.
-        """
+        inputs: dict[str, torch.Tensor | Any],
+    ) -> dict[str, Any]:
         assert self.processing_class.padding_side == "right"
         inputs = self._preprocess_inputs(inputs)
         input_ids, labels, attention_mask = (
@@ -129,65 +121,83 @@ class BD3LMTrainer(MDLMTrainer):
         b, l = input_ids.shape
         maskable_mask = labels != -100  # [b, l]
 
-        # === 1. Sample diffusion timesteps ===
-        # Each example draws a random timestep t ∈ [ε, 1), where ε avoids degenerate values near 0.
-        # The scheduler defines the masking rate α(t); we convert it to a masking probability p_mask = 1 - α(t).
         t = self.time_epsilon + (1 - self.time_epsilon) * torch.rand(
             b, device=input_ids.device
         )  # [b]
         p_mask = 1.0 - self.scheduler(t).unsqueeze(1).expand(b, l)  # [b, l]
 
-        # === 2. Apply stochastic masking ===
-        # Tokens are masked independently according to p_mask(t).
-        # Positions with label = -100 are excluded (ignored in loss).
         masked_mask = (
             torch.rand((b, l), device=input_ids.device) < p_mask
         ) & maskable_mask
-        # Replace masked tokens with the special [MASK] token.
         noised_input_ids = torch.where(
             masked_mask, self.processing_class.mask_token_id, input_ids
         )
 
-        # === 3. Forward pass through the model (block-diffusion) ===
-        # We follow the paper and feed x_t ⊕ x_0 with a specialized block mask.
+        return {
+            "inputs": inputs,
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "b": b,
+            "l": l,
+            "maskable_mask": maskable_mask,
+            "masked_mask": masked_mask,
+            "noised_input_ids": noised_input_ids,
+            "t": t,
+        }
 
-        # concat_input_ids: [b, 2l], first l are noisy (x_t), last l are clean (x_0)
-        concat_input_ids = torch.cat([noised_input_ids, input_ids], dim=1)
-
+    def _make_student_attention_mask(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        l: int,
+        device: torch.device,
+    ):
         # [TODO]: others like flash attention 2
         if self.accelerator.unwrap_model(model).config._attn_implementation == "sdpa":
             attention_mask = _create_bd3lm_attention_mask(
                 b=None,
                 h=None,
-                q_idx=torch.arange(l * 2)[:, None],
-                kv_idx=torch.arange(l * 2)[None, :],
+                q_idx=torch.arange(l * 2, device=device)[:, None],
+                kv_idx=torch.arange(l * 2, device=device)[None, :],
                 block_size=self.block_size,
                 n=l,
             )
             attention_mask = (
                 attention_mask.unsqueeze(0).unsqueeze(0).expand(1, 1, 2 * l, 2 * l)
             )
-            attention_mask = attention_mask.to(input_ids.device)
-        elif (
+            return attention_mask.to(device)
+
+        if (
             self.accelerator.unwrap_model(model).config._attn_implementation
             == "flex_attention"
         ):
             from torch.nn.attention.flex_attention import create_block_mask
 
-            attention_mask = create_block_mask(
+            return create_block_mask(
                 partial(_create_bd3lm_attention_mask, block_size=self.block_size, n=l),
                 B=None,
                 H=None,
                 Q_LEN=l * 2,
                 KV_LEN=l * 2,
             )
-        else:
-            raise NotImplementedError
 
-        base_pos = (
-            torch.arange(l, device=input_ids.device).unsqueeze(0).expand(b, l)
-        )  # [B, L]
-        concat_position_ids = torch.cat([base_pos, base_pos], dim=1)  # [B, 2L]
+        raise NotImplementedError
+
+    def _forward_student(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        input_ids: torch.Tensor,
+        noised_input_ids: torch.Tensor,
+    ):
+        b, l = input_ids.shape
+        concat_input_ids = torch.cat([noised_input_ids, input_ids], dim=1)
+        attention_mask = self._make_student_attention_mask(
+            model=model,
+            l=l,
+            device=input_ids.device,
+        )
+        base_pos = torch.arange(l, device=input_ids.device).unsqueeze(0).expand(b, l)
+        concat_position_ids = torch.cat([base_pos, base_pos], dim=1)
 
         outputs = model(
             input_ids=concat_input_ids,
@@ -195,46 +205,229 @@ class BD3LMTrainer(MDLMTrainer):
             position_ids=concat_position_ids,
         )
         outputs = self._postprocess_outputs(outputs)
-        logits = outputs.logits
+        logits = outputs.logits[:, :l]  # [b, l, v]
+        return outputs, logits
 
-        logits = logits[:, :l]  # we only care about the first half for computing loss
-
-        # === 4. Compute per-token loss weights ===
-        # Depending on the configuration, weights may depend on timestep t
-        # (e.g., scheduler-based) or be uniform (ones).
-        loss_weights = self._compute_loss_weights(
-            t=t, inputs=inputs, masked_mask=masked_mask
-        )
-
-        # === 5. Compute weighted cross-entropy ===
-        # Sanity check: ensure input_ids and labels match at valid positions
-        assert (
-            input_ids[maskable_mask] == labels[maskable_mask]
-        ).all(), "Mismatch between input_ids and labels at valid positions"
-
+    def _compute_student_token_nll(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        loss_weights: torch.Tensor,
+        masked_mask: torch.Tensor,
+    ) -> torch.Tensor:
         token_nll = F.cross_entropy(
-            logits.transpose(1, 2),  # [b, V, l]
+            logits.transpose(1, 2),  # [b, v, l]
             input_ids,  # [b, l]
             reduction="none",  # [b, l]
         )
-        token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
+        return token_nll * loss_weights * masked_mask.to(token_nll.dtype)
+
+    def _normalize_ce_loss(
+        self,
+        token_nll: torch.Tensor,
+        maskable_mask: torch.Tensor,
+        b: int,
+    ) -> torch.Tensor:
+        # Keep BD3LM CE behavior unchanged for backward compatibility.
+        if self.loss_norm_type == "token":
+            token_nll = token_nll / maskable_mask.sum().clamp_min(1)
+        elif self.loss_norm_type == "sequence":
+            token_nll = token_nll / (
+                maskable_mask.sum(-1, keepdim=True).clamp_min(1) * b
+            )
+        elif self.loss_norm_type == "batch":
+            token_nll = token_nll / b
+        else:
+            raise ValueError("Invalid loss_norm_type.")
+        return token_nll
+
+    def _normalize_kl_loss(
+        self,
+        weighted_kl: torch.Tensor,
+        masked_mask: torch.Tensor,
+        b: int,
+    ) -> torch.Tensor:
+        if self.loss_norm_type == "token":
+            weighted_kl = weighted_kl / masked_mask.sum().clamp_min(1)
+        elif self.loss_norm_type == "sequence":
+            weighted_kl = weighted_kl / (
+                masked_mask.sum(-1, keepdim=True).clamp_min(1) * b
+            )
+        elif self.loss_norm_type == "batch":
+            weighted_kl = weighted_kl / b
+        else:
+            raise ValueError("Invalid loss_norm_type.")
+        return weighted_kl
+
+    def _forward_teacher_logits(
+        self,
+        input_ids: torch.Tensor,
+        noised_input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.ar_model is None:
+            raise ValueError("KL loss requires an autoregressive model. Pass ar_model to __init__.")
+
+        with torch.no_grad():
+            if self.distillation_policy == "off_policy":
+                teacher_input_ids = input_ids
+            elif self.distillation_policy == "on_policy":
+                teacher_input_ids = noised_input_ids
+            else:
+                raise ValueError(
+                    f"Unknown distillation policy: {self.distillation_policy}. "
+                    "Available: ['off_policy', 'on_policy']"
+                )
+
+            try:
+                teacher_device = next(self.ar_model.parameters()).device
+            except StopIteration:
+                teacher_device = teacher_input_ids.device
+
+            if teacher_input_ids.device != teacher_device:
+                teacher_input_ids = teacher_input_ids.to(teacher_device)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(teacher_device)
+
+            ar_outputs = self.ar_model(
+                input_ids=teacher_input_ids,
+                attention_mask=attention_mask,
+            )
+            ar_outputs = self._postprocess_outputs(ar_outputs)
+            teacher_logits = getattr(ar_outputs, "logits", None)
+            if teacher_logits is None:
+                raise ValueError(
+                    "Teacher model output has no logits. Use a causal-LM teacher "
+                    "(e.g., transformers.AutoModelForCausalLM) for KL distillation. "
+                    f"Got output type: {type(ar_outputs).__name__}."
+                )
+            return teacher_logits
+
+    def compute_loss(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        if self.selected_loss_type == "CE+KL":
+            raise ValueError(
+                "BD3LMTrainer does not support loss_type='CE+KL'. Use 'CE' or 'KL'."
+            )
+        return super().compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            **kwargs,
+        )
+
+    def compute_CE_loss(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        batch = self._prepare_diffusion_batch(inputs)
+        outputs, logits = self._forward_student(
+            model=model,
+            input_ids=batch["input_ids"],
+            noised_input_ids=batch["noised_input_ids"],
+        )
+
+        loss_weights = self._compute_loss_weights(
+            t=batch["t"],
+            inputs=batch["inputs"],
+            masked_mask=batch["masked_mask"],
+        )
+
+        assert (
+            batch["input_ids"][batch["maskable_mask"]]
+            == batch["labels"][batch["maskable_mask"]]
+        ).all(), "Mismatch between input_ids and labels at valid positions"
+
+        token_nll = self._compute_student_token_nll(
+            logits=logits,
+            input_ids=batch["input_ids"],
+            loss_weights=loss_weights,
+            masked_mask=batch["masked_mask"],
+        )
 
         self.meter.update(
             split="train" if model.training else "eval",
             value=token_nll.detach(),
-            weight=maskable_mask.to(dtype=logits.dtype).detach(),
+            weight=batch["maskable_mask"].to(dtype=logits.dtype).detach(),
         )
 
-        # === 6. Normalize loss ===
-        if self.loss_norm_type == "token":
-            token_nll /= maskable_mask.sum().clamp_min(1)
-        elif self.loss_norm_type == "sequence":
-            token_nll /= maskable_mask.sum(-1, keepdim=True).clamp_min(1) * b
-        elif self.loss_norm_type == "batch":
-            token_nll /= b
-        else:
-            raise ValueError("Invalid loss_norm_type.")
+        token_nll = self._normalize_ce_loss(
+            token_nll=token_nll,
+            maskable_mask=batch["maskable_mask"],
+            b=batch["b"],
+        )
         loss = token_nll.sum()
+        return (loss, outputs) if return_outputs else loss
 
-        # === 7. Return final loss (and optionally model outputs) ===
+    def compute_KL_loss(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        batch = self._prepare_diffusion_batch(inputs)
+        outputs, student_logits = self._forward_student(
+            model=model,
+            input_ids=batch["input_ids"],
+            noised_input_ids=batch["noised_input_ids"],
+        )
+        teacher_logits = self._forward_teacher_logits(
+            input_ids=batch["input_ids"],
+            noised_input_ids=batch["noised_input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+
+        if teacher_logits.shape != student_logits.shape:
+            raise ValueError(
+                "Teacher and student logits must have the same shape. "
+                f"Got teacher={tuple(teacher_logits.shape)} "
+                f"and student={tuple(student_logits.shape)}."
+            )
+
+        kl_per_position = self.compute_kl_divergence(
+            ar_logits=teacher_logits,
+            dlm_logits=student_logits,
+            maskable_mask=None,
+            reduction="none",
+        )
+
+        loss_weights = self._compute_loss_weights(
+            t=batch["t"],
+            inputs=batch["inputs"],
+            masked_mask=batch["masked_mask"],
+        )
+        weighted_kl = (
+            kl_per_position
+            * loss_weights
+            * batch["masked_mask"].to(kl_per_position.dtype)
+        )
+
+        with torch.no_grad():
+            token_nll = self._compute_student_token_nll(
+                logits=student_logits,
+                input_ids=batch["input_ids"],
+                loss_weights=loss_weights,
+                masked_mask=batch["masked_mask"],
+            )
+            self.meter.update(
+                split="train" if model.training else "eval",
+                value=token_nll.detach(),
+                weight=batch["masked_mask"].to(dtype=student_logits.dtype).detach(),
+            )
+
+        weighted_kl = self._normalize_kl_loss(
+            weighted_kl=weighted_kl,
+            masked_mask=batch["masked_mask"],
+            b=batch["b"],
+        )
+        loss = weighted_kl.sum()
         return (loss, outputs) if return_outputs else loss

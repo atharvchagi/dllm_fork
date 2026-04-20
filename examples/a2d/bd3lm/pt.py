@@ -31,6 +31,7 @@ import os
 from dataclasses import dataclass, field
 
 import accelerate
+import torch
 import transformers
 
 import dllm
@@ -41,6 +42,10 @@ logger = dllm.utils.get_default_logger(__name__)
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
     model_name_or_path: str = ".models/a2d/Qwen3-0.6B"
+    teacher_model_name_or_path: str | None = None
+    teacher_dtype: str = "bfloat16"
+    teacher_load_in_4bit: bool = False
+    teacher_attn_implementation: str | None = None
 
 
 @dataclass
@@ -81,6 +86,43 @@ def train():
 
     # ----- Model ------------------------------------------------------------------
     model = dllm.utils.get_model(model_args=model_args)
+    teacher_model = None
+    if training_args.loss_type == "KL":
+        if model_args.teacher_model_name_or_path is None:
+            raise ValueError(
+                "--teacher_model_name_or_path is required when --loss_type KL for BD3LM."
+            )
+        teacher_model_name_or_path = dllm.utils.resolve_with_base_env(
+            model_args.teacher_model_name_or_path,
+            "BASE_MODELS_DIR",
+        )
+
+        teacher_kwargs = {
+            "torch_dtype": getattr(torch, model_args.teacher_dtype),
+            "attn_implementation": model_args.teacher_attn_implementation,
+        }
+        if torch.cuda.is_available():
+            teacher_kwargs["device_map"] = {
+                "": accelerate.PartialState().local_process_index
+            }
+        if model_args.teacher_load_in_4bit and transformers.utils.is_bitsandbytes_available():
+            teacher_kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=getattr(torch, model_args.teacher_dtype),
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+        teacher_model = transformers.AutoModelForCausalLM.from_pretrained(
+            teacher_model_name_or_path,
+            **teacher_kwargs,
+        )
+        teacher_model.eval()
+    elif training_args.loss_type == "CE+KL":
+        raise ValueError(
+            "BD3LM does not support --loss_type CE+KL. Use --loss_type CE or --loss_type KL."
+        )
+
     # ----- Tokenizer --------------------------------------------------------------
     tokenizer = dllm.utils.get_tokenizer(model_args=model_args)
 
@@ -118,6 +160,7 @@ def train():
     logger.info("Start training...")
     trainer = dllm.core.trainers.BD3LMTrainer(
         model=model,
+        ar_model=teacher_model,
         tokenizer=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test", None),
