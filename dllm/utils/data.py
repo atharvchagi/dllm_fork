@@ -1,3 +1,4 @@
+import json
 import random
 import warnings
 from dataclasses import dataclass
@@ -234,20 +235,77 @@ def default_sft_map_fn(row, *, tokenizer, mask_prompt_loss: bool = True) -> dict
     Returns:
         dict with keys: input_ids, labels, and optionally prompt_len
     """
+    messages = row.get("messages", None)
+
+    # Some datasets store chat messages as a JSON string instead of a list.
+    if isinstance(messages, str):
+        try:
+            messages = json.loads(messages)
+        except json.JSONDecodeError:
+            messages = None
+
+    if isinstance(messages, dict):
+        messages = [messages]
+    if not isinstance(messages, list):
+        messages = []
+
+    normalized_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", None)
+        content = msg.get("content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role not in {"system", "user", "assistant"}:
+            role = "user" if not normalized_messages else "assistant"
+        normalized_messages.append({"role": role, "content": content})
+
+    # If we only have prompt-side chat, use first non-empty candidate response as assistant target.
+    if len(normalized_messages) == 1 and normalized_messages[0]["role"] != "assistant":
+        responses = row.get("responses", None)
+        if isinstance(responses, list):
+            for resp in responses:
+                if isinstance(resp, str) and resp.strip():
+                    normalized_messages.append({"role": "assistant", "content": resp})
+                    break
+
+    # Fallback for prompt/response style datasets.
+    if len(normalized_messages) < 2:
+        prompt = row.get("prompt", None)
+        responses = row.get("responses", None)
+        if isinstance(prompt, str) and prompt.strip() and isinstance(responses, list):
+            assistant = next(
+                (resp for resp in responses if isinstance(resp, str) and resp.strip()),
+                None,
+            )
+            if assistant is not None:
+                normalized_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": assistant},
+                ]
+
+    if len(normalized_messages) < 2:
+        raise ValueError(
+            "default_sft_map_fn requires at least one user and one assistant turn."
+        )
+
     prompt_response_tokens = tokenizer.apply_chat_template(
-        row["messages"], tokenize=True, add_generation_prompt=False
+        normalized_messages, tokenize=True, add_generation_prompt=False
     )
     labels = prompt_response_tokens.copy()
 
     if mask_prompt_loss:
         prompt_tokens = tokenizer.apply_chat_template(
-            row["messages"][:-1], tokenize=True, add_generation_prompt=True
+            normalized_messages[:-1], tokenize=True, add_generation_prompt=True
         )
-        labels[: len(prompt_tokens)] = [-100] * len(prompt_tokens)
+        # Prevent Python slice-assignment from extending labels when prompt is longer.
+        prompt_len = min(len(prompt_tokens), len(labels))
+        labels[:prompt_len] = [-100] * prompt_len
         return {
             "input_ids": prompt_response_tokens,
             "labels": labels,
-            "prompt_len": len(prompt_tokens),
+            "prompt_len": prompt_len,
         }
 
     return {"input_ids": prompt_response_tokens, "labels": labels}

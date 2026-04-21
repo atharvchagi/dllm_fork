@@ -132,6 +132,8 @@ class BD3LMTrainer(MDLMTrainer):
         noised_input_ids = torch.where(
             masked_mask, self.processing_class.mask_token_id, input_ids
         )
+        
+        #print(shape(input_ids), shape(labels), shape(attention_mask), shape(maskable_mask), shape(masked_mask), shape(noised_input_ids), shape(t))
 
         return {
             "inputs": inputs,
