@@ -87,6 +87,9 @@ class BaseMetricsCallback(transformers.TrainerCallback):
         logs: dict[str, float] = {}
         for s, d in vals.items():
             for k, v in d.items():
+                # Accuracy is intended for eval dashboards; skip train-side acc.
+                if s == "train" and k == "acc":
+                    continue
                 logs[self.key_for(s, k)] = v
 
         if logs:

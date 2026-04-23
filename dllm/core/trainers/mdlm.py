@@ -19,7 +19,7 @@ import transformers
 from dllm.core.schedulers import BaseAlphaScheduler, LinearAlphaScheduler
 from dllm.utils.configs import TrainingArguments
 from dllm.utils.data import prepend_bos
-from .utils import NLLMetric, PPLMetric, OnEvaluateMetricsCallback
+from .utils import AccuracyMetric, NLLMetric, OnEvaluateMetricsCallback, PPLMetric
 
 @dataclass
 class MDLMConfig(TrainingArguments):
@@ -72,7 +72,7 @@ class MDLMTrainer(transformers.Trainer):
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
             splits=("train", "eval"),
-            metrics={"nll": NLLMetric(), "ppl": PPLMetric()},
+            metrics={"nll": NLLMetric(), "ppl": PPLMetric(), "acc": AccuracyMetric()},
         )
         self.add_callback(self.meter)
 
@@ -239,10 +239,12 @@ class MDLMTrainer(transformers.Trainer):
             reduction="none",  # [b, l]
         )
         token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
+        token_acc = (logits.argmax(dim=-1) == input_ids).to(logits.dtype)
 
         self.meter.update(
             split="train" if model.training else "eval",
-            value=token_nll.detach(),
+            token_nll=token_nll.detach(),
+            token_acc=token_acc.detach(),
             weight=maskable_mask.to(dtype=logits.dtype).detach(),
         )
 
@@ -446,11 +448,13 @@ class MDLMTrainer(transformers.Trainer):
                 reduction="none",  # [b, l]
             )
             token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
+            token_acc = (dlm_logits.argmax(dim=-1) == input_ids).to(dlm_logits.dtype)
             
             # Update metrics with NLL (not KL) for meaningful perplexity
             self.meter.update(
                 split="train" if model.training else "eval",
-                value=token_nll.detach(),
+                token_nll=token_nll.detach(),
+                token_acc=token_acc.detach(),
                 weight=masked_mask.to(dtype=dlm_logits.dtype).detach(),
             )
 
@@ -581,11 +585,13 @@ class MDLMTrainer(transformers.Trainer):
         )
         
         token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
+        token_acc = (dlm_logits.argmax(dim=-1) == input_ids).to(dlm_logits.dtype)
         
         # Update metrics with NLL (not KL) for meaningful perplexity
         self.meter.update(
             split="train" if model.training else "eval",
-            value=token_nll.detach(),
+            token_nll=token_nll.detach(),
+            token_acc=token_acc.detach(),
             weight=masked_mask.to(dtype=dlm_logits.dtype).detach(),
         )
 

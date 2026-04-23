@@ -354,10 +354,12 @@ class BD3LMTrainer(MDLMTrainer):
             loss_weights=loss_weights,
             masked_mask=batch["masked_mask"],
         )
+        token_acc = (logits.argmax(dim=-1) == batch["input_ids"]).to(logits.dtype)
 
         self.meter.update(
             split="train" if model.training else "eval",
-            value=token_nll.detach(),
+            token_nll=token_nll.detach(),
+            token_acc=token_acc.detach(),
             weight=batch["maskable_mask"].to(dtype=logits.dtype).detach(),
         )
 
@@ -420,9 +422,13 @@ class BD3LMTrainer(MDLMTrainer):
                 loss_weights=loss_weights,
                 masked_mask=batch["masked_mask"],
             )
+            token_acc = (student_logits.argmax(dim=-1) == batch["input_ids"]).to(
+                student_logits.dtype
+            )
             self.meter.update(
                 split="train" if model.training else "eval",
-                value=token_nll.detach(),
+                token_nll=token_nll.detach(),
+                token_acc=token_acc.detach(),
                 weight=batch["masked_mask"].to(dtype=student_logits.dtype).detach(),
             )
 
