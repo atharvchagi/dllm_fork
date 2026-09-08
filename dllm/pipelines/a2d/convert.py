@@ -1,3 +1,8 @@
+"""Convert an autoregressive checkpoint into an A2D checkpoint.
+
+Run ``python -m dllm.pipelines.a2d.convert --help`` for conversion options.
+"""
+
 from dataclasses import dataclass
 import os
 import shutil
@@ -19,6 +24,7 @@ class ScriptArguments:
     model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
     output_dir: str = ".models/a2d/Qwen2.5-0.5B"
     random_init: bool = False
+    loophole_enabled: bool = False
 
     def __post_init__(self):
         self.model_name_or_path = dllm.utils.resolve_with_base_env(
@@ -83,6 +89,12 @@ def main():
     # Build A2D config from source config dict
     cfg_dict = src_config.to_dict()
     cfg_dict.pop("model_type", None)
+    if args.loophole_enabled and base_type != "qwen3":
+        raise ValueError(
+            "loophole_enabled is currently supported only for A2D Qwen3 checkpoints"
+        )
+    if base_type == "qwen3":
+        cfg_dict["loophole_enabled"] = args.loophole_enabled
     tgt_config = tgt_config_cls(**cfg_dict)
 
     with dllm.utils.init_device_context_manager():
@@ -92,7 +104,18 @@ def main():
             missing, unexpected = tgt_model.load_state_dict(
                 src_model.state_dict(), strict=False
             )
-            print("missing:", missing)
+            loophole_keys = {
+                "model.loophole_norm.weight",
+                "model.loophole_norm.bias",
+            }
+            initialized_loophole_keys = sorted(set(missing) & loophole_keys)
+            other_missing = sorted(set(missing) - loophole_keys)
+            if initialized_loophole_keys:
+                print(
+                    "zero-initialized Loopholing parameters:",
+                    initialized_loophole_keys,
+                )
+            print("missing:", other_missing)
             print("unexpected:", unexpected)
 
         # Save model and config

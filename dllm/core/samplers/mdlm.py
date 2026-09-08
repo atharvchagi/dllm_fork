@@ -1,5 +1,8 @@
 """
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
+
+Run sampling through an MDLM entrypoint such as
+``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/mdlm/sample.py --help``.
 """
 
 import math
@@ -29,10 +32,151 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    loophole_enabled: bool = False
+    return_step_entropy: bool = False
+    confidence_threshold: float | None = None
 
 
 @dataclass
 class MDLMSampler(BaseSampler):
+    @staticmethod
+    def _masked_prediction_metrics(
+        logits: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute per-sequence entropy and confidence on active mask positions."""
+        batch_size = logits.shape[0]
+        entropy = torch.full(
+            (batch_size,),
+            torch.nan,
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        top1_probability = torch.full_like(entropy, torch.nan)
+        remaining_masks = active_mask.sum(dim=-1)
+
+        for row in range(batch_size):
+            selected_logits = logits[row, active_mask[row]].float()
+            if selected_logits.numel() == 0:
+                continue
+            probabilities = F.softmax(selected_logits, dim=-1)
+            token_entropy = torch.special.entr(probabilities).sum(dim=-1)
+            entropy[row] = token_entropy.mean()
+            top1_probability[row] = probabilities.amax(dim=-1).mean()
+
+        return {
+            "mean_entropy_nats": entropy.detach().cpu(),
+            "mean_top1_probability": top1_probability.detach().cpu(),
+            "remaining_masks": remaining_masks.detach().cpu(),
+        }
+
+    @staticmethod
+    def _select_transfer_index(
+        confidence: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        minimum_transfer_tokens: torch.Tensor,
+        confidence_threshold: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select scheduled tokens, plus every threshold-qualified token."""
+        batch_size = confidence.shape[0]
+        transfer_index = torch.zeros_like(candidate_mask)
+        threshold_accepted = torch.zeros(
+            batch_size,
+            dtype=torch.long,
+            device=confidence.device,
+        )
+        below_threshold_fallback = torch.zeros_like(threshold_accepted)
+
+        for row in range(batch_size):
+            masked_count = int(candidate_mask[row].sum().item())
+            minimum_count = min(
+                int(minimum_transfer_tokens[row].item()),
+                masked_count,
+            )
+            if masked_count == 0:
+                continue
+
+            if confidence_threshold is not None:
+                high_confidence = candidate_mask[row] & (
+                    confidence[row] >= confidence_threshold
+                )
+                transfer_index[row] = high_confidence
+                accepted_count = int(high_confidence.sum().item())
+                threshold_accepted[row] = accepted_count
+                fallback_count = max(0, minimum_count - accepted_count)
+                if fallback_count > 0:
+                    fallback_confidence = torch.where(
+                        candidate_mask[row] & ~high_confidence,
+                        confidence[row],
+                        -torch.inf,
+                    )
+                    _, selected = torch.topk(
+                        fallback_confidence,
+                        k=fallback_count,
+                    )
+                    transfer_index[row, selected] = True
+                    below_threshold_fallback[row] = fallback_count
+                continue
+
+            if minimum_count > 0:
+                candidate_confidence = torch.where(
+                    candidate_mask[row],
+                    confidence[row],
+                    -torch.inf,
+                )
+                _, selected = torch.topk(candidate_confidence, k=minimum_count)
+                transfer_index[row, selected] = True
+
+        return transfer_index, threshold_accepted, below_threshold_fallback
+
+    @staticmethod
+    def _selected_confidence_metrics(
+        confidence: torch.Tensor,
+        transfer_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-sequence mean and minimum committed-token confidence."""
+        batch_size = confidence.shape[0]
+        mean_confidence = torch.full(
+            (batch_size,),
+            torch.nan,
+            dtype=torch.float32,
+            device=confidence.device,
+        )
+        minimum_confidence = torch.full_like(mean_confidence, torch.nan)
+        for row in range(batch_size):
+            selected = confidence[row, transfer_index[row]].float()
+            if selected.numel() == 0:
+                continue
+            mean_confidence[row] = selected.mean()
+            minimum_confidence[row] = selected.min()
+        return mean_confidence, minimum_confidence
+
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loophole_state: torch.Tensor | None,
+        loophole_enabled: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward the canvas and advance its position-aligned recurrent state."""
+        if not loophole_enabled:
+            outputs = self.model(input_ids, attention_mask=attention_mask)
+            return outputs.logits, None
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loophole_state=loophole_state,
+            return_loophole_state=True,
+            loophole_enabled=True,
+        )
+        next_state = getattr(outputs, "loophole_state", None)
+        if next_state is None:
+            raise RuntimeError(
+                "The Loopholing sampler forward did not return loophole_state"
+            )
+        return outputs.logits, next_state
+
     @torch.no_grad()
     def sample(
         self,
@@ -71,10 +215,47 @@ class MDLMSampler(BaseSampler):
             "stochastic_transfer", config.stochastic_transfer
         )
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_history = kwargs.get("return_history", config.return_history)
         right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
+        loophole_enabled = kwargs.get(
+            "loophole_enabled", config.loophole_enabled
+        )
+        return_step_entropy = kwargs.get(
+            "return_step_entropy", config.return_step_entropy
+        )
+        confidence_threshold = kwargs.get(
+            "confidence_threshold", config.confidence_threshold
+        )
+        distillation_step_callback = kwargs.get("distillation_step_callback", None)
+        if return_step_entropy and not return_dict:
+            raise ValueError("return_step_entropy=True requires return_dict=True")
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+
+        if loophole_enabled and right_shift_logits:
+            raise ValueError(
+                "Loopholing does not yet support right_shift_logits=True because "
+                "the recurrent state would require an explicit positional shift."
+            )
+        if confidence_threshold is not None:
+            if not 0.0 <= confidence_threshold <= 1.0:
+                raise ValueError("confidence_threshold must be between 0 and 1")
+            if remasking != "low_confidence":
+                raise ValueError(
+                    "confidence_threshold requires remasking='low_confidence'"
+                )
+        if distillation_step_callback is not None:
+            if not callable(distillation_step_callback):
+                raise TypeError("distillation_step_callback must be callable")
+            if not loophole_enabled:
+                raise ValueError(
+                    "distillation_step_callback requires loophole_enabled=True"
+                )
+            if cfg_scale > 0.0:
+                raise ValueError(
+                    "distillation_step_callback does not support classifier-free guidance"
+                )
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -129,7 +310,10 @@ class MDLMSampler(BaseSampler):
         # ----- Block scheduling over the appended mask tail -----
         num_blocks = math.ceil(max_new_tokens / block_size)
         steps = math.ceil(steps / num_blocks)  # per-block step budget
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_dict and return_history else None
+        step_metrics = [] if return_step_entropy else None
+        loophole_state = None
+        global_step = 0
 
         for b in range(num_blocks):
             # Build a per-sample mask *within this block* (aligned to each prompt's tail)
@@ -160,21 +344,51 @@ class MDLMSampler(BaseSampler):
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
                 mask_index = x == mask_id  # current global mask map
+                candidate_mask = torch.zeros_like(mask_index)
+                for j in range(B):
+                    start = prompt_lens[j] + b * block_size
+                    end = min(
+                        start + block_size,
+                        prompt_lens[j] + max_new_tokens,
+                        T,
+                    )
+                    if start < end:
+                        candidate_mask[j, start:end] = mask_index[j, start:end]
+                if not candidate_mask.any():
+                    break
 
                 # Optional CFG: second forward where original prompt tokens are masked out
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask.repeat(2, 1)
-                    ).logits
+                    logits, loophole_state = self._model_forward(
+                        input_ids=x_,
+                        attention_mask=attention_mask.repeat(2, 1),
+                        loophole_state=loophole_state,
+                        loophole_enabled=loophole_enabled,
+                    )
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits, loophole_state = self._model_forward(
+                        input_ids=x,
+                        attention_mask=attention_mask,
+                        loophole_state=loophole_state,
+                        loophole_enabled=loophole_enabled,
+                    )
+
+                if distillation_step_callback is not None:
+                    distillation_step_callback(
+                        input_ids=x,
+                        attention_mask=attention_mask,
+                        candidate_mask=candidate_mask,
+                        logits=logits,
+                        loophole_state=loophole_state,
+                        global_step=global_step + 1,
+                        block=b + 1,
+                        step_in_block=i + 1,
+                    )
 
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
@@ -182,6 +396,18 @@ class MDLMSampler(BaseSampler):
 
                 if right_shift_logits:
                     logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+                if step_metrics is not None:
+                    metrics = self._masked_prediction_metrics(logits, candidate_mask)
+                    metrics.update(
+                        {
+                            "step": global_step + 1,
+                            "block": b + 1,
+                            "step_in_block": i + 1,
+                        }
+                    )
+                else:
+                    metrics = None
 
                 # Argmax decoding with optional Gumbel-Max noise for exploration
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
@@ -195,7 +421,12 @@ class MDLMSampler(BaseSampler):
 
                 # Per-position confidence used to pick which masks to commit this step
                 if remasking == "low_confidence":
-                    p = F.softmax(logits, dim=-1)
+                    confidence_logits = (
+                        logits.float()
+                        if confidence_threshold is not None
+                        else logits
+                    )
+                    p = F.softmax(confidence_logits, dim=-1)
                     x0_p = torch.squeeze(
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
                     )  # [B, T] confidence of predicted token
@@ -206,36 +437,62 @@ class MDLMSampler(BaseSampler):
                 else:
                     raise NotImplementedError(remasking)
 
-                # Restrict selection window to the *current block's* tail region
-                for j in range(B):
-                    x0_p[j, prompt_lens[j] + (b + 1) * block_size :] = -np.inf
-
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(
-                    mask_index, x0_p, -np.inf
-                )  # consider masked positions only
+                    candidate_mask, x0_p, -np.inf
+                )  # consider current-block masked positions only
 
-                # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
-                transfer_index = torch.zeros_like(
-                    x0, dtype=torch.bool, device=x0.device
-                )
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(
-                        confidence[j], k=num_transfer_tokens[j, i]
+                # The schedule is a completion floor. Threshold mode may accept
+                # more positions, allowing a block to finish before its step budget.
+                transfer_index, threshold_accepted, fallback_tokens = (
+                    self._select_transfer_index(
+                        confidence=confidence,
+                        candidate_mask=candidate_mask,
+                        minimum_transfer_tokens=num_transfer_tokens[:, i],
+                        confidence_threshold=confidence_threshold,
                     )
-                    transfer_index[j, select_index] = True
+                )
+                if metrics is not None:
+                    transferred_tokens = transfer_index.sum(dim=-1)
+                    mean_selected, minimum_selected = (
+                        self._selected_confidence_metrics(
+                            confidence,
+                            transfer_index,
+                        )
+                    )
+                    metrics.update(
+                        {
+                            "scheduled_minimum_tokens": num_transfer_tokens[
+                                :, i
+                            ].detach().cpu(),
+                            "transferred_tokens": transferred_tokens.detach().cpu(),
+                            "remaining_masks_after": (
+                                candidate_mask.sum(dim=-1) - transferred_tokens
+                            ).detach().cpu(),
+                            "mean_transferred_confidence": mean_selected.detach().cpu(),
+                            "minimum_transferred_confidence": minimum_selected.detach().cpu(),
+                            "threshold_accepted_tokens": threshold_accepted.detach().cpu(),
+                            "below_threshold_fallback_tokens": fallback_tokens.detach().cpu(),
+                        }
+                    )
+                    step_metrics.append(metrics)
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
                 if histories is not None:
                     histories.append(x.clone())
+                global_step += 1
 
         # ----- Output format -----
         if not return_dict:
             return x
         else:
-            return BaseSamplerOutput(sequences=x, histories=histories)
+            return BaseSamplerOutput(
+                sequences=x,
+                histories=histories,
+                step_metrics=step_metrics,
+            )
 
     @torch.no_grad()
     def infill(
@@ -265,10 +522,30 @@ class MDLMSampler(BaseSampler):
             "stochastic_transfer", config.stochastic_transfer
         )
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_history = kwargs.get("return_history", config.return_history)
         right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
+        loophole_enabled = kwargs.get(
+            "loophole_enabled", config.loophole_enabled
+        )
+        confidence_threshold = kwargs.get(
+            "confidence_threshold", config.confidence_threshold
+        )
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+
+        if loophole_enabled and right_shift_logits:
+            raise ValueError(
+                "Loopholing does not yet support right_shift_logits=True because "
+                "the recurrent state would require an explicit positional shift."
+            )
+        if confidence_threshold is not None:
+            if not 0.0 <= confidence_threshold <= 1.0:
+                raise ValueError("confidence_threshold must be between 0 and 1")
+            if remasking != "low_confidence":
+                raise ValueError(
+                    "confidence_threshold requires remasking='low_confidence'"
+                )
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -320,7 +597,8 @@ class MDLMSampler(BaseSampler):
         # ----- Blockwise schedule over the *entire* (padded) sequence -----
         num_blocks = math.ceil(T / block_size)
         steps_per_block = math.ceil(steps / num_blocks)
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_dict and return_history else None
+        loophole_state = None
 
         for b in range(num_blocks):
             start = b * block_size
@@ -351,21 +629,36 @@ class MDLMSampler(BaseSampler):
 
             for s in range(effective_steps):
                 mask_index_full = x == mask_id
+                candidate_mask = torch.zeros_like(mask_index_full)
+                for j in range(B):
+                    end_j = start + widths[j]
+                    if start < end_j:
+                        candidate_mask[j, start:end_j] = mask_index_full[
+                            j, start:end_j
+                        ]
+                if not candidate_mask.any():
+                    break
 
                 # ----- Forward pass (+ optional CFG) -----
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[unmasked_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(
-                        x_, attention_mask=attention_mask.repeat(2, 1)
-                    ).logits
+                    logits, loophole_state = self._model_forward(
+                        input_ids=x_,
+                        attention_mask=attention_mask.repeat(2, 1),
+                        loophole_state=loophole_state,
+                        loophole_enabled=loophole_enabled,
+                    )
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
-                    logits = self.model(
-                        x, attention_mask=attention_mask
-                    ).logits  # Use attention mask here
+                    logits, loophole_state = self._model_forward(
+                        input_ids=x,
+                        attention_mask=attention_mask,
+                        loophole_state=loophole_state,
+                        loophole_enabled=loophole_enabled,
+                    )
 
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
@@ -384,7 +677,12 @@ class MDLMSampler(BaseSampler):
 
                 # Confidence used for choosing which masks to commit this step
                 if remasking == "low_confidence":
-                    p = F.softmax(logits, dim=-1)
+                    confidence_logits = (
+                        logits.float()
+                        if confidence_threshold is not None
+                        else logits
+                    )
+                    p = F.softmax(confidence_logits, dim=-1)
                     x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(
                         -1
                     )  # [B, T]
@@ -393,24 +691,16 @@ class MDLMSampler(BaseSampler):
                 else:
                     raise NotImplementedError(remasking)
 
-                # Restrict selection to the *current* block only
-                for j in range(B):
-                    end_j = start + widths[j]
-                    # Outside current block => impossible to select
-                    x0_p[j, :start] = -np.inf
-                    x0_p[j, end_j:] = -np.inf
-
                 # Only consider currently-masked positions as candidates
                 x0 = torch.where(mask_index_full, x0, x)
-                confidence = torch.where(mask_index_full, x0_p, -np.inf)
+                confidence = torch.where(candidate_mask, x0_p, -np.inf)
 
-                # Pick exactly num_transfer_tokens[j, s] positions per sample
-                transfer_index = torch.zeros_like(x, dtype=torch.bool)
-                for j in range(B):
-                    k = int(num_transfer_tokens[j, s].item())
-                    if k > 0:
-                        _, select_idx = torch.topk(confidence[j], k=k)
-                        transfer_index[j, select_idx] = True
+                transfer_index, _, _ = self._select_transfer_index(
+                    confidence=confidence,
+                    candidate_mask=candidate_mask,
+                    minimum_transfer_tokens=num_transfer_tokens[:, s],
+                    confidence_threshold=confidence_threshold,
+                )
 
                 # Commit selected predictions into the canvas
                 x[transfer_index] = x0[transfer_index]

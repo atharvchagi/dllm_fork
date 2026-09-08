@@ -13,7 +13,7 @@ import torchmetrics
 
 
 class _KwargMeanMetric(torchmetrics.aggregation.MeanMetric):
-    """MeanMetric that reads value/weight from keyword arguments."""
+    """MeanMetric supporting trainer-specific keywords and positional updates."""
 
     def __init__(self, value_key: str, **kwargs):
         kwargs.setdefault("sync_on_compute", True)
@@ -21,16 +21,27 @@ class _KwargMeanMetric(torchmetrics.aggregation.MeanMetric):
         self.value_key = value_key
 
     def update(self, *args, **kwargs):
-        # Backward compatibility: older code paths may pass value=... directly.
+        # Trainer callbacks use the metric-specific key, while direct callers and
+        # older code use the ordinary MeanMetric positional/value conventions.
         if self.value_key in kwargs:
             value = kwargs[self.value_key]
+        elif "value" in kwargs:
+            value = kwargs["value"]
+        elif args:
+            value = args[0]
         else:
-            value = kwargs.get("value", None)
+            value = None
         if value is None:
             raise ValueError(
-                f"Missing metric value for key '{self.value_key}' in kwargs."
+                f"Missing metric value for key '{self.value_key}'."
             )
-        weight = kwargs.get("weight", None)
+
+        positional_weight = args[1] if len(args) > 1 else None
+        if len(args) > 2:
+            raise TypeError("Metric update accepts at most value and weight")
+        if positional_weight is not None and "weight" in kwargs:
+            raise TypeError("Metric weight was provided both positionally and by keyword")
+        weight = kwargs.get("weight", positional_weight)
         return super().update(value, weight=weight)
 
 

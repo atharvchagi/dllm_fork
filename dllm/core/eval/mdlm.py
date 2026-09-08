@@ -78,6 +78,7 @@ class MDLMEvalHarness(BaseEvalHarness):
         )
 
         self.mask_id = self.tokenizer.mask_token_id
+        self.loophole_enabled = self.sampler_config.loophole_enabled
         self.max_length = int(kwargs.get("max_length", eval_config.max_length))
         self.mc_num = int(kwargs.get("mc_num", eval_config.mc_num))
         self.is_check_greedy = kwargs.get(
@@ -108,7 +109,28 @@ class MDLMEvalHarness(BaseEvalHarness):
         self, batch: torch.Tensor, prompt_index: torch.Tensor
     ) -> torch.Tensor:
         """Plain forward; CFG is handled in the sampler (generate_until)."""
-        logits = self.model(batch).logits
+        if not self.loophole_enabled:
+            logits = self.model(batch).logits
+            return logits[:, : batch.shape[1]]
+
+        pseudo_outputs = self.model(
+            input_ids=batch,
+            loophole_state=None,
+            return_loophole_state=True,
+            loophole_enabled=True,
+        )
+        loophole_state = getattr(pseudo_outputs, "loophole_state", None)
+        if loophole_state is None:
+            raise RuntimeError(
+                "The Loopholing evaluation forward did not return loophole_state"
+            )
+        outputs = self.model(
+            input_ids=batch,
+            loophole_state=loophole_state.detach(),
+            return_loophole_state=True,
+            loophole_enabled=True,
+        )
+        logits = outputs.logits
         return logits[:, : batch.shape[1]]
 
     def _forward_process(

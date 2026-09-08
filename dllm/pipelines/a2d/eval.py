@@ -63,6 +63,32 @@ def _inject_enable_thinking(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def _inject_loophole_enabled(args: argparse.Namespace) -> argparse.Namespace:
+    """Merge the top-level Loopholing flag into MDLM model/sampler arguments."""
+    if args.loophole_enabled is None:
+        return args
+
+    if isinstance(args.model_args, dict):
+        model_args = dict(args.model_args)
+    else:
+        model_args = simple_parse_args_string(args.model_args)
+
+    if (
+        "loophole_enabled" in model_args
+        and model_args["loophole_enabled"] != args.loophole_enabled
+    ):
+        logging.warning(
+            "Overriding model_args loophole_enabled=%s with CLI flag "
+            "loophole_enabled=%s",
+            model_args["loophole_enabled"],
+            args.loophole_enabled,
+        )
+
+    model_args["loophole_enabled"] = args.loophole_enabled
+    args.model_args = model_args
+    return args
+
+
 if __name__ == "__main__":
     parser = setup_parser()
     parser.add_argument(
@@ -71,5 +97,16 @@ if __name__ == "__main__":
         default=None,
         help="Override chat-template thinking behavior for compatible models.",
     )
+    parser.add_argument(
+        "--loophole_enabled",
+        "--loophole-enabled",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable Qwen3 Loopholing for deterministic two-pass likelihood "
+            "evaluation and recurrent MDLM generation."
+        ),
+    )
     args = parse_eval_args(parser)
-    cli_evaluate(_inject_enable_thinking(args))
+    args = _inject_enable_thinking(args)
+    cli_evaluate(_inject_loophole_enabled(args))

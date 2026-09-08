@@ -1,3 +1,9 @@
+"""Model and tokenizer loading helpers.
+
+Run the related tests with
+``pytest /nvme-data2/atharvchagi/dllm_fork/scripts/tests/test_loopholing.py -v``.
+"""
+
 from types import SimpleNamespace
 
 import accelerate
@@ -7,6 +13,12 @@ from peft import prepare_model_for_kbit_training
 
 from dllm.utils.configs import ModelArguments, TrainingArguments
 from dllm.utils.utils import disable_caching_allocator_warmup, load_peft, print_main
+
+
+def _ensure_mask_token(tokenizer, default_mask_token: str) -> None:
+    """Set a family default only when the checkpoint has no mask token."""
+    if tokenizer.mask_token is None:
+        tokenizer.add_special_tokens({"mask_token": default_mask_token})
 
 
 def get_model(
@@ -193,11 +205,11 @@ def get_tokenizer(
 {% endif %}
 """
     elif issubclass(model_cls, A2DLlamaLMHeadModel):
-        tokenizer.add_special_tokens({"mask_token": "<|mask|>"})
+        _ensure_mask_token(tokenizer, "<|mask|>")
         tokenizer.eot_token = "<|eot_id|>"
         tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eot_token)
     elif issubclass(model_cls, (A2DQwen2LMHeadModel, A2DQwen3LMHeadModel)):
-        tokenizer.add_special_tokens({"mask_token": "<|mask|>"})
+        _ensure_mask_token(tokenizer, "<|mask|>")
         tokenizer.eot_token = "<|im_end|>"
         tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eot_token)
         # When enable_thinking is not passed, default to False so the chat template

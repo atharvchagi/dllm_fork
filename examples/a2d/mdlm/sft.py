@@ -74,7 +74,17 @@ def train():
     dllm.utils.initial_training_setup(model_args, data_args, training_args)
 
     # ----- Model ------------------------------------------------------------------
-    model = dllm.utils.get_model(model_args=model_args)
+    model_config = None
+    if training_args.loophole_enabled:
+        model_config = transformers.AutoConfig.from_pretrained(
+            model_args.model_name_or_path
+        )
+        if not isinstance(model_config, dllm.pipelines.a2d.A2DQwen3Config):
+            raise ValueError(
+                "--loophole_enabled currently requires an A2D Qwen3 checkpoint"
+            )
+        model_config.loophole_enabled = True
+    model = dllm.utils.get_model(model_args=model_args, config=model_config)
     # ----- Tokenizer --------------------------------------------------------------
     tokenizer = dllm.utils.get_tokenizer(model_args=model_args)
 

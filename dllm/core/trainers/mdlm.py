@@ -6,6 +6,9 @@ https://arxiv.org/abs/2406.07524
 
 Large Language Diffusion Models:
 https://arxiv.org/abs/2502.09992
+
+Run training through an MDLM entrypoint such as
+``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/mdlm/pt.py --help``.
 """
 
 from typing import Any, Union, Optional
@@ -23,14 +26,17 @@ from .utils import AccuracyMetric, NLLMetric, OnEvaluateMetricsCallback, PPLMetr
 
 @dataclass
 class MDLMConfig(TrainingArguments):
-   time_epsilon: float = 1e-3
-   loss_weight_type: str = "scheduler"  # "scheduler", "uniform"
-   loss_norm_type: str = "token"  # "batch", "sequence", "token"
-   right_shift_logits: bool = False
-   loss_type: str = "CE"  # "CE", "KL", "CE+KL"
-   distillation_policy: str = "off_policy"  # "off_policy", "on_policy"
-   kl_divergence_type: str = "forward"  # "forward", "reverse"
-   kl_weight: float = 1.0  # Weight for KL term in CE+KL loss (loss = CE + kl_weight * KL)
+    time_epsilon: float = 1e-3
+    loss_weight_type: str = "scheduler"  # "scheduler", "uniform"
+    loss_norm_type: str = "token"  # "batch", "sequence", "token"
+    right_shift_logits: bool = False
+    loss_type: str = "CE"  # "CE", "KL", "CE+KL"
+    distillation_policy: str = "off_policy"  # "off_policy", "on_policy"
+    kl_divergence_type: str = "forward"  # "forward", "reverse"
+    kl_weight: float = 1.0  # loss = CE + kl_weight * KL
+    loophole_enabled: bool = False
+    loophole_self_cond_rate: float = 0.9
+    loophole_eval_self_cond_rate: float = 1.0
 
 class MDLMTrainer(transformers.Trainer):
 
@@ -42,6 +48,21 @@ class MDLMTrainer(transformers.Trainer):
         *pargs,
         **kwargs,
     ):
+        for name in ("loophole_self_cond_rate", "loophole_eval_self_cond_rate"):
+            rate = getattr(args, name)
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {rate}")
+        if args.loophole_enabled and args.right_shift_logits:
+            raise ValueError(
+                "Loopholing does not yet support right_shift_logits=True because "
+                "the recurrent state would require an explicit positional shift."
+            )
+        if args.loophole_enabled and args.loss_type != "CE":
+            raise ValueError(
+                "Loopholing currently supports only loss_type='CE'; KL and CE+KL "
+                "remain on the baseline single-pass path."
+            )
+
         super().__init__(args=args, *pargs, **kwargs)
 
         if not (0.0 < args.time_epsilon < 1.0):
@@ -56,6 +77,18 @@ class MDLMTrainer(transformers.Trainer):
         self.distillation_policy = args.distillation_policy
         self.kl_divergence_type = args.kl_divergence_type
         self.kl_weight = args.kl_weight
+        self.loophole_enabled = args.loophole_enabled
+        self.loophole_self_cond_rate = args.loophole_self_cond_rate
+        self.loophole_eval_self_cond_rate = args.loophole_eval_self_cond_rate
+
+        if self.loophole_enabled and not getattr(
+            getattr(self.model, "config", None), "loophole_enabled", False
+        ):
+            raise ValueError(
+                "loophole_enabled=True requires an A2D Qwen3 model loaded with a "
+                "Loopholing-enabled config. Use the Qwen3 MDLM training entrypoint or "
+                "convert the checkpoint with --loophole-enabled."
+            )
         
         # Optional AR model for KL divergence computation
         self.ar_model = ar_model
@@ -75,6 +108,52 @@ class MDLMTrainer(transformers.Trainer):
             metrics={"nll": NLLMetric(), "ppl": PPLMetric(), "acc": AccuracyMetric()},
         )
         self.add_callback(self.meter)
+
+    def _forward_with_loopholing(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ):
+        """Run the reference detached pseudo-state pass and the loss-bearing pass."""
+        if not self.loophole_enabled:
+            return model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self_cond_rate = (
+            self.loophole_self_cond_rate
+            if model.training
+            else self.loophole_eval_self_cond_rate
+        )
+        use_self_conditioning = self_cond_rate >= 1.0
+        if 0.0 < self_cond_rate < 1.0:
+            use_self_conditioning = bool(
+                torch.rand((), device=input_ids.device) < self_cond_rate
+            )
+
+        loophole_state = None
+        if use_self_conditioning:
+            with torch.no_grad():
+                pseudo_outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loophole_state=None,
+                    return_loophole_state=True,
+                    loophole_enabled=True,
+                )
+            loophole_state = getattr(pseudo_outputs, "loophole_state", None)
+            if loophole_state is None:
+                raise RuntimeError(
+                    "The Loopholing pseudo-state forward did not return loophole_state"
+                )
+            loophole_state = loophole_state.detach()
+
+        return model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loophole_state=loophole_state,
+            return_loophole_state=True,
+            loophole_enabled=True,
+        )
 
     def _preprocess_inputs(self, inputs):
         if self.right_shift_logits:
@@ -213,7 +292,11 @@ class MDLMTrainer(transformers.Trainer):
 
         # === 3. Forward pass through the model ===
         # The model predicts clean tokens given noised inputs.
-        outputs = model(input_ids=noised_input_ids, attention_mask=attention_mask)
+        outputs = self._forward_with_loopholing(
+            model=model,
+            input_ids=noised_input_ids,
+            attention_mask=attention_mask,
+        )
         outputs = self._postprocess_outputs(outputs)
         logits = outputs.logits
 
@@ -725,4 +808,3 @@ class MDLMTrainer(transformers.Trainer):
     #             """
 
     #         return loss.detach()
-    
