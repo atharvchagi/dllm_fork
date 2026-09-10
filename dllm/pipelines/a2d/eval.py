@@ -64,7 +64,7 @@ def _inject_enable_thinking(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _inject_loophole_enabled(args: argparse.Namespace) -> argparse.Namespace:
-    """Merge the top-level Loopholing flag into MDLM model/sampler arguments."""
+    """Merge the top-level Loopholing flag into model/sampler arguments."""
     if args.loophole_enabled is None:
         return args
 
@@ -104,7 +104,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Enable Qwen3 Loopholing for deterministic two-pass likelihood "
-            "evaluation and recurrent MDLM generation."
+            "evaluation and recurrent MDLM or BD3LM generation."
         ),
     )
     args = parse_eval_args(parser)

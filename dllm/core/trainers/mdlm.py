@@ -40,6 +40,8 @@ class MDLMConfig(TrainingArguments):
 
 class MDLMTrainer(transformers.Trainer):
 
+    _supports_right_shift_loopholing = False
+
     def __init__(
         self,
         args: MDLMConfig,
@@ -52,7 +54,11 @@ class MDLMTrainer(transformers.Trainer):
             rate = getattr(args, name)
             if not 0.0 <= rate <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {rate}")
-        if args.loophole_enabled and args.right_shift_logits:
+        if (
+            args.loophole_enabled
+            and args.right_shift_logits
+            and not self._supports_right_shift_loopholing
+        ):
             raise ValueError(
                 "Loopholing does not yet support right_shift_logits=True because "
                 "the recurrent state would require an explicit positional shift."
@@ -86,7 +92,7 @@ class MDLMTrainer(transformers.Trainer):
         ):
             raise ValueError(
                 "loophole_enabled=True requires an A2D Qwen3 model loaded with a "
-                "Loopholing-enabled config. Use the Qwen3 MDLM training entrypoint or "
+                "Loopholing-enabled config. Use an A2D Qwen3 training entrypoint or "
                 "convert the checkpoint with --loophole-enabled."
             )
         
@@ -109,15 +115,27 @@ class MDLMTrainer(transformers.Trainer):
         )
         self.add_callback(self.meter)
 
+    def _align_loophole_state_for_input(
+        self,
+        loophole_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Align a pseudo-state with the tokens consumed by the second pass."""
+        return loophole_state
+
     def _forward_with_loopholing(
         self,
         model: transformers.PreTrainedModel | nn.Module,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        **model_kwargs,
     ):
         """Run the reference detached pseudo-state pass and the loss-bearing pass."""
         if not self.loophole_enabled:
-            return model(input_ids=input_ids, attention_mask=attention_mask)
+            return model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **model_kwargs,
+            )
 
         self_cond_rate = (
             self.loophole_self_cond_rate
@@ -139,13 +157,16 @@ class MDLMTrainer(transformers.Trainer):
                     loophole_state=None,
                     return_loophole_state=True,
                     loophole_enabled=True,
+                    **model_kwargs,
                 )
             loophole_state = getattr(pseudo_outputs, "loophole_state", None)
             if loophole_state is None:
                 raise RuntimeError(
                     "The Loopholing pseudo-state forward did not return loophole_state"
                 )
-            loophole_state = loophole_state.detach()
+            loophole_state = self._align_loophole_state_for_input(
+                loophole_state.detach()
+            )
 
         return model(
             input_ids=input_ids,
@@ -153,6 +174,7 @@ class MDLMTrainer(transformers.Trainer):
             loophole_state=loophole_state,
             return_loophole_state=True,
             loophole_enabled=True,
+            **model_kwargs,
         )
 
     def _preprocess_inputs(self, inputs):

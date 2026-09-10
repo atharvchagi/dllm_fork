@@ -3,6 +3,9 @@ References:
 
 Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models:
 https://arxiv.org/abs/2503.09573
+
+Run training through a BD3LM entrypoint such as
+``python /scratch/user/atharvchagi_tamu.edu/dllm_fork/examples/a2d/bd3lm/sft.py --help``.
 """
 
 from dataclasses import dataclass
@@ -89,6 +92,8 @@ class BD3LMConfig(MDLMConfig):
 
 class BD3LMTrainer(MDLMTrainer):
 
+    _supports_right_shift_loopholing = True
+
     def __init__(
         self,
         args: BD3LMConfig,
@@ -106,6 +111,26 @@ class BD3LMTrainer(MDLMTrainer):
             "CE": self.compute_CE_loss,
             "KL": self.compute_KL_loss,
         }
+
+    def _align_loophole_state_for_input(
+        self,
+        loophole_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply A2D's AR shift independently to the ``x_t`` and ``x_0`` streams."""
+        if not self.right_shift_logits:
+            return loophole_state
+        if loophole_state.shape[1] % 2 != 0:
+            raise ValueError(
+                "BD3LM Loophole state must contain equal x_t and x_0 streams"
+            )
+
+        stream_length = loophole_state.shape[1] // 2
+        shifted_streams = []
+        for stream in loophole_state.split(stream_length, dim=1):
+            shifted_streams.append(
+                torch.cat([torch.zeros_like(stream[:, :1]), stream[:, :-1]], dim=1)
+            )
+        return torch.cat(shifted_streams, dim=1)
 
     def _prepare_diffusion_batch(
         self,
@@ -201,7 +226,8 @@ class BD3LMTrainer(MDLMTrainer):
         base_pos = torch.arange(l, device=input_ids.device).unsqueeze(0).expand(b, l)
         concat_position_ids = torch.cat([base_pos, base_pos], dim=1)
 
-        outputs = model(
+        outputs = self._forward_with_loopholing(
+            model=model,
             input_ids=concat_input_ids,
             attention_mask=attention_mask,
             position_ids=concat_position_ids,

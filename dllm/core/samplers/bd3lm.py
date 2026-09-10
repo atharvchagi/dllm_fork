@@ -1,5 +1,8 @@
 """
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
+
+Run sampling with
+``python /scratch/user/atharvchagi_tamu.edu/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy
@@ -149,10 +152,57 @@ class BD3LMSamplerConfig(BaseSamplerConfig):
     cfg_scale: float = 0.0
     cfg_keep_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    loophole_enabled: bool = False
 
 
 @dataclass
 class BD3LMSampler(BaseSampler):
+
+    def _forward_block(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values,
+        loophole_state: torch.Tensor | None,
+        loophole_enabled: bool,
+        right_shift_logits: bool,
+        prefix_last_loophole_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward one denoising block and advance its recurrent state."""
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": False,
+        }
+        if not loophole_enabled:
+            outputs = self.model(**model_kwargs)
+            return outputs.logits, None
+
+        outputs = self.model(
+            **model_kwargs,
+            loophole_state=loophole_state,
+            return_loophole_state=True,
+            loophole_enabled=True,
+        )
+        next_state = getattr(outputs, "loophole_state", None)
+        if next_state is None:
+            raise RuntimeError(
+                "The BD3LM Loopholing sampler forward did not return "
+                "loophole_state"
+            )
+        if right_shift_logits:
+            if prefix_last_loophole_state is None:
+                raise RuntimeError(
+                    "Right-shifted BD3LM Loopholing requires the final prefix state"
+                )
+            next_state = torch.cat(
+                [prefix_last_loophole_state, next_state[:, :-1]],
+                dim=1,
+            )
+        return outputs.logits, next_state
 
     @torch.no_grad()
     def sample(
@@ -194,6 +244,9 @@ class BD3LMSampler(BaseSampler):
         )
         return_dict = kwargs.get("return_dict", config.return_dict)
         right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
+        loophole_enabled = kwargs.get(
+            "loophole_enabled", config.loophole_enabled
+        )
 
         assert block_size >= 1
         assert steps >= 1
@@ -290,6 +343,14 @@ class BD3LMSampler(BaseSampler):
                 block_size=block_size,
                 pad_token_id=pad_id,
             )  # [B,1,T_prefix,T_prefix], [B,T_prefix]
+            prefix_loophole_kwargs = (
+                {
+                    "loophole_enabled": True,
+                    "return_loophole_state": right_shift_logits,
+                }
+                if loophole_enabled
+                else {}
+            )
 
             # Conditional prefix cache + last logits
             out_prefix = self.model(
@@ -297,9 +358,19 @@ class BD3LMSampler(BaseSampler):
                 attention_mask=prefix_attn,
                 position_ids=prefix_pos,
                 use_cache=True,
+                **prefix_loophole_kwargs,
             )
             cond_past = out_prefix.past_key_values
             cond_prefix_last_logits = out_prefix.logits[:, -1:, :]  # [B, 1, V]
+            cond_prefix_last_loophole_state = None
+            if loophole_enabled and right_shift_logits:
+                cond_prefix_state = getattr(out_prefix, "loophole_state", None)
+                if cond_prefix_state is None:
+                    raise RuntimeError(
+                        "The BD3LM Loopholing prefix forward did not return "
+                        "loophole_state"
+                    )
+                cond_prefix_last_loophole_state = cond_prefix_state[:, -1:]
 
             # Unconditional prefix cache + last logits (if CFG enabled)
             if cfg_scale > 0.0:
@@ -311,12 +382,25 @@ class BD3LMSampler(BaseSampler):
                     attention_mask=prefix_attn,
                     position_ids=prefix_pos,
                     use_cache=True,
+                    **prefix_loophole_kwargs,
                 )
                 uncond_past = out_un_prefix.past_key_values
                 uncond_prefix_last_logits = out_un_prefix.logits[:, -1:, :]  # [B, 1, V]
+                uncond_prefix_last_loophole_state = None
+                if loophole_enabled and right_shift_logits:
+                    uncond_prefix_state = getattr(
+                        out_un_prefix, "loophole_state", None
+                    )
+                    if uncond_prefix_state is None:
+                        raise RuntimeError(
+                            "The unconditional BD3LM Loopholing prefix forward did "
+                            "not return loophole_state"
+                        )
+                    uncond_prefix_last_loophole_state = uncond_prefix_state[:, -1:]
             else:
                 uncond_past = None
                 uncond_prefix_last_logits = None
+                uncond_prefix_last_loophole_state = None
 
             # ------------------------------------------------------
             # 2.2) Append new block of mask tokens to the right
@@ -361,6 +445,12 @@ class BD3LMSampler(BaseSampler):
             ]  # [B,1,L_q,T_total]
             pos_block = full_position_ids[:, T_prefix:T_total]  # [B,L_q]
 
+            # Recurrent states are position-aligned to this block. A new block has
+            # different positions (and may have a different width), so it starts
+            # from the null state. CFG branches evolve independently thereafter.
+            cond_loophole_state = None
+            uncond_loophole_state = None
+
             # ======================================================
             # 3) Inner diffusion loop within the current block
             # ======================================================
@@ -372,25 +462,33 @@ class BD3LMSampler(BaseSampler):
                     break
 
                 # ---- Conditional logits for current block ----
-                cond_logits_block = self.model(
-                    x_block,
+                cond_logits_block, cond_loophole_state = self._forward_block(
+                    input_ids=x_block,
                     attention_mask=attn_block,
                     position_ids=pos_block,
                     past_key_values=copy.deepcopy(cond_past),
-                    use_cache=False,
-                ).logits  # [B, cur_block_len, V]
+                    loophole_state=cond_loophole_state,
+                    loophole_enabled=loophole_enabled,
+                    right_shift_logits=right_shift_logits,
+                    prefix_last_loophole_state=cond_prefix_last_loophole_state,
+                )  # [B, cur_block_len, V]
 
                 logits_block = cond_logits_block
 
                 # ---- Optional CFG ----
                 if cfg_scale > 0.0:
-                    un_logits_block = self.model(
-                        x_block,
+                    un_logits_block, uncond_loophole_state = self._forward_block(
+                        input_ids=x_block,
                         attention_mask=attn_block,
                         position_ids=pos_block,
                         past_key_values=copy.deepcopy(uncond_past),
-                        use_cache=False,
-                    ).logits  # [B, cur_block_len, V]
+                        loophole_state=uncond_loophole_state,
+                        loophole_enabled=loophole_enabled,
+                        right_shift_logits=right_shift_logits,
+                        prefix_last_loophole_state=(
+                            uncond_prefix_last_loophole_state
+                        ),
+                    )  # [B, cur_block_len, V]
 
                     logits_block = un_logits_block + (cfg_scale + 1.0) * (
                         cond_logits_block - un_logits_block
