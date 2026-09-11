@@ -222,7 +222,8 @@ def train():
                 transformers.DataCollatorForSeq2Seq(
                     tokenizer,
                     return_tensors="pt",
-                    padding=True,
+                    padding="max_length",
+                    max_length=data_args.max_length,
                 ),
                 block_size=training_args.block_size,
             )
