@@ -8,7 +8,7 @@ Large Language Diffusion Models:
 https://arxiv.org/abs/2502.09992
 
 Run training through an MDLM entrypoint such as
-``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/mdlm/pt.py --help``.
+``python /nvme-data/neeleshgarg/dllm_fork/examples/a2d/mdlm/pt.py --help``.
 """
 
 from typing import Any, Union, Optional
@@ -41,6 +41,7 @@ class MDLMConfig(TrainingArguments):
 class MDLMTrainer(transformers.Trainer):
 
     _supports_right_shift_loopholing = False
+    _loophole_loss_types = ("CE",)
 
     def __init__(
         self,
@@ -63,10 +64,10 @@ class MDLMTrainer(transformers.Trainer):
                 "Loopholing does not yet support right_shift_logits=True because "
                 "the recurrent state would require an explicit positional shift."
             )
-        if args.loophole_enabled and args.loss_type != "CE":
+        if args.loophole_enabled and args.loss_type not in self._loophole_loss_types:
             raise ValueError(
-                "Loopholing currently supports only loss_type='CE'; KL and CE+KL "
-                "remain on the baseline single-pass path."
+                "Loopholing does not support the requested loss type. "
+                f"Available: {list(self._loophole_loss_types)}"
             )
 
         super().__init__(args=args, *pargs, **kwargs)

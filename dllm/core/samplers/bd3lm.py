@@ -184,6 +184,7 @@ class BD3LMSampler(BaseSampler):
         outputs = self.model(
             **model_kwargs,
             loophole_state=loophole_state,
+            loophole_mask=input_ids == self.tokenizer.mask_token_id,
             return_loophole_state=True,
             loophole_enabled=True,
         )
@@ -347,6 +348,7 @@ class BD3LMSampler(BaseSampler):
                 {
                     "loophole_enabled": True,
                     "return_loophole_state": right_shift_logits,
+                    "loophole_mask": torch.zeros_like(x_prefix, dtype=torch.bool),
                 }
                 if loophole_enabled
                 else {}

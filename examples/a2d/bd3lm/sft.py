@@ -87,7 +87,17 @@ def train():
     dllm.utils.initial_training_setup(model_args, data_args, training_args)
 
     # ----- Model ------------------------------------------------------------------
-    model = dllm.utils.get_model(model_args=model_args)
+    model_config = None
+    if training_args.loophole_enabled:
+        model_config = transformers.AutoConfig.from_pretrained(
+            model_args.model_name_or_path
+        )
+        if not isinstance(model_config, dllm.pipelines.a2d.A2DQwen3Config):
+            raise ValueError(
+                "--loophole_enabled currently requires an A2D Qwen3 checkpoint"
+            )
+        model_config.loophole_enabled = True
+    model = dllm.utils.get_model(model_args=model_args, config=model_config)
     teacher_model = None
     if training_args.loss_type == "KL":
         if model_args.teacher_model_name_or_path is None:
@@ -187,7 +197,8 @@ def train():
                 transformers.DataCollatorForSeq2Seq(
                     tokenizer,
                     return_tensors="pt",
-                    padding=True,
+                    padding="max_length",
+                    max_length=data_args.max_length,
                 ),
                 block_size=training_args.block_size,
             )

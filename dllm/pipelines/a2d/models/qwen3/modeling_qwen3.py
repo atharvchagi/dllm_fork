@@ -81,6 +81,7 @@ class A2DQwen3Model(transformers.Qwen3Model):
         self,
         inputs_embeds: torch.Tensor,
         loophole_state: Optional[torch.Tensor],
+        loophole_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.loophole_norm is None:
             raise ValueError(
@@ -108,7 +109,15 @@ class A2DQwen3Model(transformers.Qwen3Model):
                 )
             loophole_state = loophole_state.to(dtype=inputs_embeds.dtype)
 
-        return inputs_embeds + self.loophole_norm(loophole_state)
+        delta = self.loophole_norm(loophole_state)
+        if loophole_mask is not None:
+            if loophole_mask.shape != inputs_embeds.shape[:2]:
+                raise ValueError(
+                    "loophole_mask must have shape "
+                    f"{tuple(inputs_embeds.shape[:2])}, got {tuple(loophole_mask.shape)}"
+                )
+            delta = delta * loophole_mask.unsqueeze(-1).to(delta.dtype)
+        return inputs_embeds + delta
 
     def forward(
         self,
@@ -120,6 +129,7 @@ class A2DQwen3Model(transformers.Qwen3Model):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         loophole_state: Optional[torch.FloatTensor] = None,
+        loophole_mask: Optional[torch.BoolTensor] = None,
         return_loophole_state: bool = False,
         loophole_enabled: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -145,6 +155,7 @@ class A2DQwen3Model(transformers.Qwen3Model):
             inputs_embeds = self._inject_loophole_state(
                 inputs_embeds=inputs_embeds,
                 loophole_state=loophole_state,
+                loophole_mask=loophole_mask,
             )
 
         if use_cache and past_key_values is None:
@@ -276,6 +287,7 @@ class A2DQwen3LMHeadModel(transformers.Qwen3ForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         loophole_state: Optional[torch.FloatTensor] = None,
+        loophole_mask: Optional[torch.BoolTensor] = None,
         return_loophole_state: bool = False,
         loophole_enabled: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -289,6 +301,7 @@ class A2DQwen3LMHeadModel(transformers.Qwen3ForCausalLM):
             use_cache=use_cache,
             cache_position=cache_position,
             loophole_state=loophole_state,
+            loophole_mask=loophole_mask,
             return_loophole_state=return_loophole_state,
             loophole_enabled=loophole_enabled,
             **kwargs,
