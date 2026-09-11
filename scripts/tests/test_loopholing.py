@@ -1,6 +1,6 @@
 """Unit tests for Qwen3 Loopholing training and sampling.
 
-Run with ``pytest /nvme-data2/atharvchagi/dllm_fork/scripts/tests/test_loopholing.py -v``
+Run with ``pytest /scratch/user/atharvchagi_tamu.edu/dllm_fork/scripts/tests/test_loopholing.py -v``
 after activating the ``dllm`` conda environment.
 """
 
@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 
 from dllm.core.eval.mdlm import MDLMEvalHarness
+from dllm.core.samplers.bd3lm import BD3LMSampler, BD3LMSamplerConfig
 from dllm.core.samplers.mdlm import MDLMSampler, MDLMSamplerConfig
+from dllm.core.trainers.bd3lm import BD3LMTrainer
 from dllm.core.trainers.mdlm import MDLMTrainer
 from dllm.data.offpolicy_distillation import (
     OfflineTraceCollator,
@@ -194,6 +196,7 @@ class _RecordingLoopholeLM(nn.Module):
         loophole_state=None,
         return_loophole_state=False,
         loophole_enabled=None,
+        position_ids=None,
     ):
         self.calls.append(
             {
@@ -206,6 +209,9 @@ class _RecordingLoopholeLM(nn.Module):
                 "grad_enabled": torch.is_grad_enabled(),
                 "loophole_state": loophole_state,
                 "loophole_enabled": loophole_enabled,
+                "position_ids": (
+                    None if position_ids is None else position_ids.detach().clone()
+                ),
             }
         )
         hidden = self.embedding(input_ids)
@@ -279,6 +285,75 @@ def test_evaluation_uses_evaluation_self_conditioning_rate():
     assert all(call["grad_enabled"] is False for call in model.calls)
 
 
+def test_bd3lm_training_self_conditions_the_concatenated_forward():
+    trainer = BD3LMTrainer.__new__(BD3LMTrainer)
+    trainer.loophole_enabled = True
+    trainer.loophole_self_cond_rate = 1.0
+    trainer.loophole_eval_self_cond_rate = 1.0
+    trainer.right_shift_logits = False
+    trainer._make_student_attention_mask = Mock(
+        return_value=torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    )
+    model = _RecordingLoopholeLM().train()
+    input_ids = torch.tensor([[1, 2]])
+    noised_input_ids = torch.tensor([[7, 2]])
+
+    outputs, logits = trainer._forward_student(
+        model=model,
+        input_ids=input_ids,
+        noised_input_ids=noised_input_ids,
+    )
+    logits.sum().backward()
+
+    expected_concat = torch.tensor([[7, 2, 1, 2]])
+    expected_positions = torch.tensor([[0, 1, 0, 1]])
+    assert outputs.logits.shape[:2] == expected_concat.shape
+    assert logits.shape[:2] == input_ids.shape
+    assert len(model.calls) == 2
+    assert model.calls[0]["grad_enabled"] is False
+    assert model.calls[1]["grad_enabled"] is True
+    assert model.calls[1]["loophole_state"].requires_grad is False
+    assert torch.equal(model.calls[0]["input_ids"], expected_concat)
+    assert torch.equal(model.calls[1]["input_ids"], expected_concat)
+    assert torch.equal(model.calls[0]["position_ids"], expected_positions)
+    assert torch.equal(model.calls[1]["position_ids"], expected_positions)
+    assert model.embedding.weight.grad is not None
+
+
+def test_bd3lm_training_aligns_loophole_state_for_a2d_right_shift():
+    trainer = BD3LMTrainer.__new__(BD3LMTrainer)
+    trainer.loophole_enabled = True
+    trainer.loophole_self_cond_rate = 1.0
+    trainer.loophole_eval_self_cond_rate = 1.0
+    trainer.right_shift_logits = True
+    trainer._make_student_attention_mask = Mock(
+        return_value=torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    )
+    model = _RecordingLoopholeLM().train()
+    input_ids = torch.tensor([[1, 2]])
+    noised_input_ids = torch.tensor([[7, 2]])
+
+    trainer._forward_student(
+        model=model,
+        input_ids=input_ids,
+        noised_input_ids=noised_input_ids,
+    )
+
+    concat_input_ids = torch.tensor([[7, 2, 1, 2]])
+    with torch.no_grad():
+        raw_state = model.embedding(concat_input_ids)
+    expected_state = torch.cat(
+        [
+            torch.zeros_like(raw_state[:, :1]),
+            raw_state[:, :1],
+            torch.zeros_like(raw_state[:, 2:3]),
+            raw_state[:, 2:3],
+        ],
+        dim=1,
+    )
+    assert torch.equal(model.calls[1]["loophole_state"], expected_state)
+
+
 def test_eval_harness_uses_two_pass_loophole_logits():
     harness = MDLMEvalHarness.__new__(MDLMEvalHarness)
     harness.model = _RecordingLoopholeLM().eval()
@@ -328,6 +403,56 @@ class _SamplerLoopholeLM(nn.Module):
         )
 
 
+class _BD3LMSamplerLoopholeLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.calls = []
+        self.block_forward_count = 0
+
+    @property
+    def device(self):
+        return self.anchor.device
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=None,
+        loophole_state=None,
+        return_loophole_state=False,
+        loophole_enabled=None,
+    ):
+        is_prefix = use_cache is True
+        if not is_prefix:
+            self.block_forward_count += 1
+        self.calls.append(
+            {
+                "is_prefix": is_prefix,
+                "loophole_state": loophole_state,
+                "return_loophole_state": return_loophole_state,
+                "loophole_enabled": loophole_enabled,
+            }
+        )
+
+        batch, length = input_ids.shape
+        logits = torch.zeros(batch, length, 8, device=input_ids.device)
+        logits[..., 3] = 10.0
+        state_value = -1.0 if is_prefix else float(self.block_forward_count)
+        next_state = torch.full(
+            (batch, length, 4),
+            fill_value=state_value,
+            device=input_ids.device,
+        )
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=(torch.zeros(1, device=input_ids.device),),
+            loophole_state=next_state if return_loophole_state else None,
+        )
+
+
 def test_sampler_carries_state_between_steps_and_resets_between_requests():
     model = _SamplerLoopholeLM()
     tokenizer = SimpleNamespace(mask_token_id=7, bos_token_id=1, eos_token_id=0)
@@ -347,6 +472,106 @@ def test_sampler_carries_state_between_steps_and_resets_between_requests():
 
     sampler.sample(inputs=[[1]], config=config)
     assert model.calls[first_request_call_count] is None
+
+
+def test_bd3lm_sampler_carries_state_within_blocks_and_resets_between_blocks():
+    model = _BD3LMSamplerLoopholeLM()
+    tokenizer = SimpleNamespace(
+        mask_token_id=7,
+        bos_token_id=1,
+        pad_token_id=0,
+        eos_token_id=6,
+    )
+    sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
+    config = BD3LMSamplerConfig(
+        max_new_tokens=4,
+        block_size=2,
+        steps=4,
+        loophole_enabled=True,
+    )
+
+    sampler.sample(inputs=[[1]], config=config)
+
+    block_calls = [call for call in model.calls if not call["is_prefix"]]
+    assert len(block_calls) == 4
+    assert block_calls[0]["loophole_state"] is None
+    assert torch.equal(
+        block_calls[1]["loophole_state"],
+        torch.ones_like(block_calls[1]["loophole_state"]),
+    )
+    assert block_calls[2]["loophole_state"] is None
+    assert torch.equal(
+        block_calls[3]["loophole_state"],
+        torch.full_like(block_calls[3]["loophole_state"], 3.0),
+    )
+    assert all(call["return_loophole_state"] for call in block_calls)
+    assert all(call["loophole_enabled"] is True for call in block_calls)
+    prefix_calls = [call for call in model.calls if call["is_prefix"]]
+    assert all(call["loophole_enabled"] is True for call in prefix_calls)
+
+
+def test_bd3lm_sampler_keeps_cfg_loophole_states_separate():
+    model = _BD3LMSamplerLoopholeLM()
+    tokenizer = SimpleNamespace(
+        mask_token_id=7,
+        bos_token_id=1,
+        pad_token_id=0,
+        eos_token_id=6,
+    )
+    sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
+    config = BD3LMSamplerConfig(
+        max_new_tokens=2,
+        block_size=2,
+        steps=2,
+        cfg_scale=1.0,
+        loophole_enabled=True,
+    )
+
+    sampler.sample(inputs=[[1]], config=config)
+
+    block_calls = [call for call in model.calls if not call["is_prefix"]]
+    assert len(block_calls) == 4
+    assert block_calls[0]["loophole_state"] is None
+    assert block_calls[1]["loophole_state"] is None
+    assert torch.equal(
+        block_calls[2]["loophole_state"],
+        torch.ones_like(block_calls[2]["loophole_state"]),
+    )
+    assert torch.equal(
+        block_calls[3]["loophole_state"],
+        torch.full_like(block_calls[3]["loophole_state"], 2.0),
+    )
+
+
+def test_bd3lm_sampler_aligns_loophole_state_for_a2d_right_shift():
+    model = _BD3LMSamplerLoopholeLM()
+    tokenizer = SimpleNamespace(
+        mask_token_id=7,
+        bos_token_id=1,
+        pad_token_id=0,
+        eos_token_id=6,
+    )
+    sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
+
+    sampler.sample(
+        inputs=[[1]],
+        config=BD3LMSamplerConfig(
+            max_new_tokens=2,
+            block_size=2,
+            steps=2,
+            loophole_enabled=True,
+            right_shift_logits=True,
+        ),
+    )
+
+    prefix_calls = [call for call in model.calls if call["is_prefix"]]
+    block_calls = [call for call in model.calls if not call["is_prefix"]]
+    assert len(prefix_calls) == 1
+    assert prefix_calls[0]["return_loophole_state"] is True
+    assert len(block_calls) == 2
+    assert block_calls[0]["loophole_state"] is None
+    expected_state = torch.tensor([[[-1.0] * 4, [1.0] * 4]])
+    assert torch.equal(block_calls[1]["loophole_state"], expected_state)
 
 
 def test_sampler_returns_entropy_for_each_masked_generation_step():
