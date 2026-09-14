@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
-# Run the matched non-Relay BD3LM baseline on four GPUs.
+# Run directly with: bash /nvme-data/neeleshgarg/dllm_fork/scripts/relay/train/qwen_0.6b_bd3lm_block4_k2.sh
 
 set -euo pipefail
+
+source /home/ngarg2/miniforge3/etc/profile.d/conda.sh
+conda activate /nvme-data/neeleshgarg/envs/dllm
 
 cd /nvme-data/neeleshgarg/dllm_fork
 
@@ -12,7 +15,7 @@ WANDB_MODE=online WANDB_PROJECT="block-relay" accelerate launch \
   --num_processes 4 \
   /nvme-data/neeleshgarg/dllm_fork/examples/a2d/bd3lm/sft.py \
   --num_proc 8 \
-  --loss_type CE \
+  --loss_type BPTT \
   --model_name_or_path /nvme-data/neeleshgarg/dllm_fork/.models/a2d/Qwen3-0.6B-a2d-init \
   --dataset_args Jotsna22/mix_60k_4096_Qwen3-4B_chunk10000_ntokens4096_greedy \
   --max_length 2048 \
@@ -24,11 +27,13 @@ WANDB_MODE=online WANDB_PROJECT="block-relay" accelerate launch \
   --gradient_checkpointing True \
   --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --block_size 4 \
-  --loophole_enabled False \
+  --loophole_enabled True \
+  --relay_num_steps 2 \
+  --relay_unmask_threshold 0.85 \
   --right_shift_logits True \
   --eval_dataset_args openai/gsm8k[test:1319] \
   --eval_strategy epoch \
   --save_strategy epoch \
   --logging_steps 10 \
-  --run_name bd3lm-baseline-b4 \
-  --output_dir /nvme-data/neeleshgarg/dllm_fork/.models/a2d/Qwen3-0.6B-a2d-init/bd3lm/baseline/block4
+  --run_name bd3lm-relay-k2-b4-parallel \
+  --output_dir /nvme-data/neeleshgarg/dllm_fork/.models/a2d/Qwen3-0.6B-a2d-init/bd3lm/relay_block4_k2

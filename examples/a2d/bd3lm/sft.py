@@ -4,7 +4,6 @@ Run ``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sft.py --help`
 after activating the ``dllm`` conda environment.
 """
 
-import os
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -46,6 +45,10 @@ class DataArguments(dllm.utils.DataArguments):
 @dataclass
 class TrainingArguments(dllm.core.trainers.BD3LMConfig):
     output_dir: str = ".models/a2d/Qwen3-0.6B/bd3lm/alpaca"
+    eval_only: bool = field(
+        default=False,
+        metadata={"help": "Evaluate the checkpoint without loading or training on the training dataset"},
+    )
     group_by_length: bool = True
     num_train_epochs: int = 20
     learning_rate: float = 1e-4
@@ -169,16 +172,18 @@ def train():
         return dllm.utils.post_process_dataset(ds, data_args)
 
     with accelerate.PartialState().local_main_process_first():
-        dataset = dllm.data.load_sft_dataset(
-            data_args.dataset_args,
-            load_preprocessed_data=data_args.load_preprocessed_data,
-        )
-        dataset = _map_and_postprocess(
-            ds=dataset,
-            mask_prompt_loss=data_args.mask_prompt_loss,
-        )
-
-        eval_dataset = dataset.get("test", None)
+        dataset = None
+        eval_dataset = None
+        if not training_args.eval_only:
+            dataset = dllm.data.load_sft_dataset(
+                data_args.dataset_args,
+                load_preprocessed_data=data_args.load_preprocessed_data,
+            )
+            dataset = _map_and_postprocess(
+                ds=dataset,
+                mask_prompt_loss=data_args.mask_prompt_loss,
+            )
+            eval_dataset = dataset.get("test", None)
         if data_args.eval_dataset_args:
             eval_raw = dllm.data.load_sft_dataset(
                 data_args.eval_dataset_args,
@@ -200,7 +205,7 @@ def train():
 
     eval_strategy = getattr(training_args, "eval_strategy", "no")
     eval_strategy = getattr(eval_strategy, "value", str(eval_strategy)).lower()
-    if eval_strategy != "no" and eval_dataset is None:
+    if (training_args.eval_only or eval_strategy != "no") and eval_dataset is None:
         raise ValueError(
             "Evaluation is enabled but no eval split was found. "
             "Provide --eval_dataset_args with a dataset containing test/validation, "
@@ -214,7 +219,7 @@ def train():
         model=model,
         ar_model=teacher_model,
         tokenizer=tokenizer,
-        train_dataset=dataset["train"],
+        train_dataset=None if dataset is None else dataset["train"],
         eval_dataset=eval_dataset,
         args=training_args,
         data_collator=(
@@ -229,11 +234,30 @@ def train():
             )
         ),
     )
+    if training_args.eval_only:
+        metrics = trainer.evaluate()
+        relay_metrics = next(
+            (
+                entry
+                for entry in reversed(trainer.state.log_history)
+                if "eval_ppl" in entry
+            ),
+            {},
+        )
+        metrics.update(
+            {
+                key: value
+                for key, value in relay_metrics.items()
+                if key.startswith("eval_")
+            }
+        )
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        return metrics
+
     trainer.train()
-    trainer.save_model(os.path.join(training_args.output_dir, "checkpoint-final"))
-    trainer.processing_class.save_pretrained(
-        os.path.join(training_args.output_dir, "checkpoint-final")
-    )
+    trainer.save_model(training_args.output_dir)
+    trainer.processing_class.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":
