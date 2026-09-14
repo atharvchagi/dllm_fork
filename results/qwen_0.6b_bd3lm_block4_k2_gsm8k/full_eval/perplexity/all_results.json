@@ -1,0 +1,16 @@
+{
+    "eval_acc": 0.38385939598083496,
+    "eval_loss": 7.218560695648193,
+    "eval_model_preparation_time": 0.0054,
+    "eval_nll": 3.53122615814209,
+    "eval_ppl": 34.16583251953125,
+    "eval_relay/adapter_weight_norm": 0.6046741604804993,
+    "eval_relay/completed_slot_fraction": 0.0,
+    "eval_relay/loss_1": 4.013205528259277,
+    "eval_relay/loss_2": 3.2077841758728027,
+    "eval_relay/mask_ratio_step_1": 0.9999999403953552,
+    "eval_relay/revealed_fraction_step_1": 0.3550715148448944,
+    "eval_runtime": 514.4648,
+    "eval_samples_per_second": 2.564,
+    "eval_steps_per_second": 0.641
+}

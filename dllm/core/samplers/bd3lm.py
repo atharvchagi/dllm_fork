@@ -1,13 +1,14 @@
-"""
-reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
+"""BD3LM block-diffusion sampling.
 
-Run sampling with
-``python /scratch/user/atharvchagi_tamu.edu/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+Run with ``python /nvme-data/neeleshgarg/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy
+import hashlib
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -137,6 +138,35 @@ def _diffusion_step_block(
     return x_block_new
 
 
+def _dynamic_diffusion_step_block(
+    logits: torch.Tensor,
+    x_block: torch.Tensor,
+    mask_block: torch.Tensor,
+    temperature: float,
+    threshold: float,
+) -> torch.Tensor:
+    """Commit every confident prediction plus the best remaining position."""
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    predictions = torch.argmax(logits_with_noise, dim=-1)
+    # Match Relay training's fp32 confidence calculation around the threshold.
+    probabilities = F.softmax(logits.float(), dim=-1)
+    confidence = torch.gather(
+        probabilities, dim=-1, index=predictions.unsqueeze(-1)
+    ).squeeze(-1)
+    confidence = confidence.masked_fill(~mask_block, float("-inf"))
+
+    transfer = (confidence >= threshold) & mask_block
+    active = mask_block.any(dim=-1)
+    if active.any():
+        best_position = confidence.argmax(dim=-1)
+        batch_indices = torch.arange(logits.shape[0], device=logits.device)
+        transfer[batch_indices[active], best_position[active]] = True
+
+    updated = x_block.clone()
+    updated[transfer] = predictions[transfer]
+    return updated
+
+
 @dataclass
 class BD3LMSamplerConfig(BaseSamplerConfig):
     max_new_tokens: int = 128
@@ -153,6 +183,8 @@ class BD3LMSamplerConfig(BaseSamplerConfig):
     cfg_keep_tokens: list[int] | None = None
     right_shift_logits: bool = False
     loophole_enabled: bool = False
+    relay_unmask_threshold: float | None = None
+    nfe_output_path: str | None = None
 
 
 @dataclass
@@ -231,8 +263,6 @@ class BD3LMSampler(BaseSampler):
             config = BD3LMSamplerConfig()
 
         # ---- pull args from config, allow kwargs to override ----
-        steps = kwargs.get("steps", config.steps)
-        steps_per_block = kwargs.get("steps_per_block", config.steps_per_block)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
         max_length = kwargs.get("max_length", config.max_length)
         block_size = kwargs.get("block_size", config.block_size)
@@ -248,9 +278,22 @@ class BD3LMSampler(BaseSampler):
         loophole_enabled = kwargs.get(
             "loophole_enabled", config.loophole_enabled
         )
+        relay_unmask_threshold = kwargs.get(
+            "relay_unmask_threshold", config.relay_unmask_threshold
+        )
+        nfe_output_path = kwargs.get("nfe_output_path", config.nfe_output_path)
 
         assert block_size >= 1
-        assert steps >= 1
+        steps = None
+        steps_per_block = None
+        if relay_unmask_threshold is None:
+            steps = kwargs.get("steps", config.steps)
+            steps_per_block = kwargs.get("steps_per_block", config.steps_per_block)
+            assert steps >= 1
+        if relay_unmask_threshold is not None and not (
+            0.0 <= relay_unmask_threshold <= 1.0
+        ):
+            raise ValueError("relay_unmask_threshold must be in [0, 1]")
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -272,12 +315,6 @@ class BD3LMSampler(BaseSampler):
 
         prompt_lens = [p.shape[0] for p in inputs]
 
-        # Decide how many new tokens to generate
-        if max_new_tokens:
-            max_length = max_new_tokens + max(prompt_lens)
-        else:
-            max_new_tokens = max_length - max(prompt_lens)
-
         B = len(inputs)
         max_prompt_len = max(prompt_lens)
 
@@ -288,6 +325,20 @@ class BD3LMSampler(BaseSampler):
         padded_prompt_len = (
             (max_prompt_len + block_size - 1) // block_size
         ) * block_size
+
+        # A positive max_new_tokens is an output-token budget. Setting it to zero
+        # activates max_length as a combined padded-prompt-plus-output budget.
+        if max_new_tokens:
+            max_length = max_new_tokens + padded_prompt_len
+        else:
+            if max_length is None:
+                raise ValueError("max_length is required when max_new_tokens is zero")
+            max_new_tokens = max_length - padded_prompt_len
+            if max_new_tokens <= 0:
+                raise ValueError(
+                    f"Padded prompt length {padded_prompt_len} must be below "
+                    f"max_length {max_length}"
+                )
 
         x = torch.full(
             (B, padded_prompt_len),
@@ -310,10 +361,11 @@ class BD3LMSampler(BaseSampler):
 
         # track done per sequence (EOS)
         done = torch.zeros((B,), dtype=torch.bool, device=self.model.device)
+        nfe_per_sample = torch.zeros((B,), dtype=torch.long, device=self.model.device)
 
         # ---- block scheduling ----
         num_blocks = math.ceil(max_new_tokens / block_size)
-        if steps_per_block is None:
+        if relay_unmask_threshold is None and steps_per_block is None:
             steps_per_block = math.ceil(steps / num_blocks)
         histories = [x.clone()] if return_dict else None
 
@@ -410,6 +462,8 @@ class BD3LMSampler(BaseSampler):
             new_block = torch.full(
                 (B, cur_block_len), mask_id, dtype=torch.long, device=self.model.device
             )
+            if relay_unmask_threshold is not None:
+                new_block[done] = pad_id
             x = torch.cat([x, new_block], dim=1)  # [B, T_prefix + cur_block_len]
 
             unmasked_index = torch.cat(
@@ -426,13 +480,19 @@ class BD3LMSampler(BaseSampler):
 
             block_mask_index = x[:, -cur_block_len:] == mask_id  # [B, cur_block_len]
 
-            num_transfer_tokens = get_num_transfer_tokens(
-                mask_index=block_mask_index,
-                steps=steps_per_block,
-                scheduler=self.scheduler,
-                stochastic=stochastic_transfer,
-            )
-            effective_steps = num_transfer_tokens.size(1)
+            if relay_unmask_threshold is None:
+                num_transfer_tokens = get_num_transfer_tokens(
+                    mask_index=block_mask_index,
+                    steps=steps_per_block,
+                    scheduler=self.scheduler,
+                    stochastic=stochastic_transfer,
+                )
+                effective_steps = num_transfer_tokens.size(1)
+            else:
+                num_transfer_tokens = None
+                # The forced best-position reveal guarantees completion in at
+                # most one forward per position in this block.
+                effective_steps = cur_block_len
 
             # Full attention mask + pos for prefix + current block
             full_attention_mask, full_position_ids = _prepare_for_sampling(
@@ -462,6 +522,8 @@ class BD3LMSampler(BaseSampler):
 
                 if not mask_block.any():
                     break
+
+                nfe_per_sample += mask_block.any(dim=-1).to(nfe_per_sample.dtype)
 
                 # ---- Conditional logits for current block ----
                 cond_logits_block, cond_loophole_state = self._forward_block(
@@ -513,14 +575,23 @@ class BD3LMSampler(BaseSampler):
                     logits_block = shifted
 
                 # ---- One diffusion step over this block ----
-                x_block_updated = _diffusion_step_block(
-                    logits=logits_block,
-                    x_block=x_block,
-                    mask_block=mask_block,
-                    num_transfer_step=num_transfer_tokens[:, i_step],
-                    temperature=temperature,
-                    remasking=remasking,
-                )
+                if relay_unmask_threshold is None:
+                    x_block_updated = _diffusion_step_block(
+                        logits=logits_block,
+                        x_block=x_block,
+                        mask_block=mask_block,
+                        num_transfer_step=num_transfer_tokens[:, i_step],
+                        temperature=temperature,
+                        remasking=remasking,
+                    )
+                else:
+                    x_block_updated = _dynamic_diffusion_step_block(
+                        logits=logits_block,
+                        x_block=x_block,
+                        mask_block=mask_block,
+                        temperature=temperature,
+                        threshold=relay_unmask_threshold,
+                    )
 
                 # Write back
                 x[:, T_prefix:T_total] = x_block_updated
@@ -534,6 +605,33 @@ class BD3LMSampler(BaseSampler):
                 done = done | eos_in_block
 
             generated += cur_block_len
+
+        if nfe_output_path is not None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            base_path = Path(nfe_output_path)
+            rank_path = base_path.with_name(
+                f"{base_path.stem}.rank{rank}{base_path.suffix}"
+            )
+            rank_path.parent.mkdir(parents=True, exist_ok=True)
+            initialized_paths = getattr(self, "_initialized_nfe_paths", set())
+            mode = "a" if rank_path in initialized_paths else "w"
+            with rank_path.open(mode, encoding="utf-8") as handle:
+                for prompt, nfe in zip(inputs, nfe_per_sample.tolist()):
+                    prompt_ids = (
+                        prompt.tolist() if isinstance(prompt, torch.Tensor) else prompt
+                    )
+                    prompt_hash = hashlib.sha256(
+                        json.dumps(prompt_ids, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    handle.write(
+                        json.dumps({"prompt_sha256": prompt_hash, "nfe": nfe}) + "\n"
+                    )
+            initialized_paths.add(rank_path)
+            self._initialized_nfe_paths = initialized_paths
 
         # ==========================================================
         # 4) Output
