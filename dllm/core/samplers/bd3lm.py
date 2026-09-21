@@ -1,6 +1,6 @@
 """BD3LM block-diffusion sampling.
 
-Run with ``python /nvme-data/neeleshgarg/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+Run with ``python /nvme-data/neeleshgarg/repos/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy

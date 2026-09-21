@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
 
-# Run directly with: bash /nvme-data/neeleshgarg/dllm_fork/scripts/relay/eval/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh
+# Run directly with: bash /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/eval/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh
+# Optional first argument: model epochs, 5 or 8 (default 8).
 
 set -euo pipefail
 
-cd /nvme-data/neeleshgarg/dllm_fork
+model_epochs=${1:-8}
+if [[ "${model_epochs}" != 5 && "${model_epochs}" != 8 ]]; then
+  echo "Model epochs must be 5 or 8." >&2
+  exit 1
+fi
 
-export PYTHONPATH=/nvme-data/neeleshgarg/dllm_fork
+cd /nvme-data/neeleshgarg/repos/dllm_fork
+
+export PYTHONPATH=/nvme-data/neeleshgarg/repos/dllm_fork
 export HF_DATASETS_TRUST_REMOTE_CODE=True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-checkpoint=/nvme-data/neeleshgarg/dllm_fork/.models/a2d/Qwen3-0.6B-a2d-init/bd3lm/relay_block4_k2
-result_dir=/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_bd3lm_block4_k2_gsm8k/full_eval/dynamic
+checkpoint=/nvme-data/neeleshgarg/repos/dllm_fork/.models/Qwen/Qwen3-0.6b-a2d-init/bd3lm/relay_block4_k2_${model_epochs}ep
+result_dir=/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/${model_epochs}ep/full_eval/dynamic
 log_file=${result_dir}/eval.log
 nfe_file=${result_dir}/dynamic_nfe.jsonl
 
+if [[ ! -f "${checkpoint}/model.safetensors" ]]; then
+  echo "Missing trained checkpoint: ${checkpoint}" >&2
+  exit 1
+fi
 mkdir -p "${result_dir}"
 rm -f "${result_dir}"/dynamic_nfe.rank*.jsonl
 
@@ -22,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
   /nvme-data/neeleshgarg/envs/dllm/bin/python \
   -m accelerate.commands.launch \
   --num_processes 8 \
-  /nvme-data/neeleshgarg/dllm_fork/dllm/pipelines/a2d/eval.py \
+  /nvme-data/neeleshgarg/repos/dllm_fork/dllm/pipelines/a2d/eval.py \
   --tasks gsm8k_cot \
   --model a2d_bd3lm \
   --device cuda \
@@ -32,15 +43,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
   --loophole_enabled \
   --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=2048,block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
   --output_path "${result_dir}" \
-  --wandb_args "project=block-relay,name=bd3lm-relay-block4-k2-gsm8k-dynamic-2048-eval,job_type=eval" \
-  --wandb_config_args "block_size=4,relay_steps=2,max_length=2048,decoding=dynamic,relay_unmask_threshold=0.85,num_gpus=8" \
+  --wandb_args "project=block-relay,name=bd3lm-relay-block4-k2-${model_epochs}ep-gsm8k-dynamic-2048-eval,job_type=eval" \
+  --wandb_config_args "block_size=4,relay_steps=2,max_length=2048,decoding=dynamic,relay_unmask_threshold=0.85,num_gpus=8,model_epochs=${model_epochs}" \
   --log_samples 2>&1 | tee "${log_file}"
 
 /nvme-data/neeleshgarg/envs/dllm/bin/python \
-  - "${result_dir}" "${checkpoint}" <<'PY'
+  - "${result_dir}" "${checkpoint}" "${model_epochs}" <<'PY'
 """Summarize GSM8K accuracy and end-to-end generation throughput.
 
-Run through /nvme-data/neeleshgarg/dllm_fork/scripts/relay/eval/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh after lm-eval finishes.
+Run through /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/eval/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh after lm-eval finishes.
 """
 
 import json
@@ -83,6 +94,7 @@ if sample_files:
     )
 
 summary = {
+    "model_epochs": int(sys.argv[3]),
     "result_file": str(result_file.resolve()),
     "metrics": result["results"][task],
     "total_evaluation_time_seconds": seconds,
@@ -120,3 +132,5 @@ summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 print(json.dumps(summary, indent=2))
 print(f"Wrote {summary_path.resolve()}")
 PY
+
+/nvme-data/neeleshgarg/envs/dllm/bin/python /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/summarize_throughput.py

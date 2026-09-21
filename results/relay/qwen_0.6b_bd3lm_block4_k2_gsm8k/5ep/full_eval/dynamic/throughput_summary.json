@@ -1,0 +1,27 @@
+{
+  "result_file": "/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/5ep/full_eval/dynamic/results_2026-09-12T19-30-36.051739.json",
+  "metrics": {
+    "alias": "gsm8k_cot",
+    "exact_match,strict-match": 0.0,
+    "exact_match_stderr,strict-match": 0.0,
+    "exact_match,flexible-extract": 0.13495072024260804,
+    "exact_match_stderr,flexible-extract": 0.00941131528257119
+  },
+  "total_evaluation_time_seconds": 3294.428378490964,
+  "evaluated_samples": 1319,
+  "aggregate_samples_per_second": 0.4003729474319843,
+  "generated_tokens": 732829,
+  "aggregate_output_tokens_per_second": 222.44496337652285,
+  "num_gpus": 8,
+  "max_sequence_length": 2048,
+  "decoding": "dynamic confidence-threshold",
+  "throughput_scope": "eight-GPU end-to-end lm-eval wall time",
+  "dynamic_unmask_threshold": 0.85,
+  "nfe_samples": 1319,
+  "mean_active_denoising_nfe": 264.63078089461715,
+  "median_active_denoising_nfe": 176,
+  "min_active_denoising_nfe": 26,
+  "max_active_denoising_nfe": 1039,
+  "sample_file": "/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/5ep/full_eval/dynamic/samples_gsm8k_cot_2026-09-12T19-30-36.051739.jsonl",
+  "model_epochs": 5
+}

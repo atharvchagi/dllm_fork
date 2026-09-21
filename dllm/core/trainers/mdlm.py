@@ -8,7 +8,7 @@ Large Language Diffusion Models:
 https://arxiv.org/abs/2502.09992
 
 Run training through an MDLM entrypoint such as
-``python /nvme-data/neeleshgarg/dllm_fork/examples/a2d/mdlm/pt.py --help``.
+``python /nvme-data/neeleshgarg/repos/dllm_fork/examples/a2d/mdlm/pt.py --help``.
 """
 
 from typing import Any, Union, Optional

@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 
-# Run directly with: bash /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh
-# Optional first argument: total prompt + output limit (default 2048).
-# Optional second argument: model epochs, 5 or 8 (default 8).
-# Optional third argument: physical GPU index (default 1).
-# Example: append 512 5 7 for the original model on GPU 7 at a 512-token limit.
+# Run: bash /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/qwen_0.6b_bd3lm_block4_baseline_gsm8k.sh
+# Optional arguments: total prompt + output limit (default 2048), physical GPU index (default 1).
 
 set -euo pipefail
 
 max_length=${1:-2048}
-model_epochs=${2:-8}
-gpu_id=${3:-1}
+gpu_id=${2:-1}
 if [[ ! "${max_length}" =~ ^[1-9][0-9]*$ ]]; then
   echo "Sequence length must be a positive integer." >&2
-  exit 1
-fi
-if [[ "${model_epochs}" != 5 && "${model_epochs}" != 8 ]]; then
-  echo "Model epochs must be 5 or 8." >&2
   exit 1
 fi
 if [[ ! "${gpu_id}" =~ ^[0-9]+$ ]]; then
@@ -29,18 +21,19 @@ conda activate /nvme-data/neeleshgarg/envs/dllm
 
 cd /nvme-data/neeleshgarg/repos/dllm_fork
 
-checkpoint=/nvme-data/neeleshgarg/repos/dllm_fork/.models/Qwen/Qwen3-0.6b-a2d-init/bd3lm/relay_block4_k2_${model_epochs}ep
-result_dir=/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/${model_epochs}ep/throughput_random32/dynamic/len${max_length}/$(date +%Y%m%d_%H%M%S)
+checkpoint=/nvme-data/neeleshgarg/repos/dllm_fork/.models/Qwen/Qwen3-0.6b-a2d-init/bd3lm/block4_len4096_baseline
+result_dir=/nvme-data/neeleshgarg/repos/dllm_fork/results/qwen_0.6b_bd3lm_block4_baseline_gsm8k/throughput_random32/dynamic/len${max_length}/$(date +%Y%m%d_%H%M%S)
 log_file=${result_dir}/eval.log
 nfe_file=${result_dir}/dynamic_nfe.jsonl
 sample_selection='{"gsm8k_cot":[13,51,54,61,65,178,191,209,228,285,318,326,407,447,451,457,476,501,563,569,696,859,864,865,919,1034,1116,1149,1206,1209,1232,1309]}'
 
 if [[ ! -f "${checkpoint}/model.safetensors" ]]; then
-  echo "Missing trained checkpoint: ${checkpoint}" >&2
+  echo "Missing baseline checkpoint: ${checkpoint}" >&2
   exit 1
 fi
 mkdir -p "${result_dir}"
 
+# Keep the Relay benchmark's dynamic reveal rule while disabling the adapter.
 CUDA_VISIBLE_DEVICES="${gpu_id}" WANDB_MODE=disabled \
   accelerate launch \
   --num_processes 1 \
@@ -52,15 +45,14 @@ CUDA_VISIBLE_DEVICES="${gpu_id}" WANDB_MODE=disabled \
   --num_fewshot 0 \
   --batch_size 1 \
   --samples "${sample_selection}" \
-  --loophole_enabled \
-  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=${max_length},block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
+  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=${max_length},block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,loophole_enabled=False,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
   --output_path "${result_dir}" \
   --log_samples 2>&1 | tee "${log_file}"
 
-python - "${result_dir}" "${checkpoint}" "${sample_selection}" "${max_length}" "${model_epochs}" <<'PY'
-"""Summarize the completed one-GPU GSM8K throughput benchmark.
+python - "${result_dir}" "${checkpoint}" "${sample_selection}" "${max_length}" "${gpu_id}" <<'PY'
+"""Summarize the no-Relay GSM8K benchmark.
 
-Run through /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/qwen_0.6b_bd3lm_block4_k2_gsm8k.sh.
+Run through /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/qwen_0.6b_bd3lm_block4_baseline_gsm8k.sh.
 """
 
 import json
@@ -74,17 +66,13 @@ import dllm
 result_dir = Path(sys.argv[1])
 checkpoint = sys.argv[2]
 sample_selection = json.loads(sys.argv[3])
-result_file = max(
-    result_dir.glob("results_*.json"),
-    key=lambda path: path.stat().st_mtime,
-)
+result_file = max(result_dir.rglob("results_*.json"), key=lambda path: path.stat().st_mtime)
 result = json.loads(result_file.read_text(encoding="utf-8"))
 task = "gsm8k_cot"
 seconds = float(result["total_evaluation_time_seconds"])
 
 sample_file = max(
-    result_dir.glob(f"samples_{task}_*.jsonl"),
-    key=lambda path: path.stat().st_mtime,
+    result_dir.rglob(f"samples_{task}_*.jsonl"), key=lambda path: path.stat().st_mtime
 )
 responses_by_doc = {}
 with sample_file.open(encoding="utf-8") as handle:
@@ -110,7 +98,7 @@ for nfe_path in result_dir.glob("dynamic_nfe.rank*.jsonl"):
 nfe_values = list(nfe_by_prompt.values())
 
 summary = {
-    "model_epochs": int(sys.argv[5]),
+    "model": "divelab/Qwen3-0.6B-bd3lm-block4-len4096-baseline",
     "result_file": str(result_file.resolve()),
     "metrics": result["results"][task],
     "total_evaluation_time_seconds": seconds,
@@ -121,6 +109,7 @@ summary = {
     "output_tokens_per_second": generated_tokens / seconds,
     "output_tokens_per_second_per_gpu": generated_tokens / seconds,
     "num_gpus": 1,
+    "gpu": int(sys.argv[5]),
     "batch_size_per_gpu": 1,
     "sample_selection": "32 random GSM8K document IDs generated with seed 42",
     "sample_doc_ids": sample_selection[task],
@@ -129,6 +118,7 @@ summary = {
     "token_count_scope": "decoded, stop-trimmed outputs re-tokenized",
     "decoding": "dynamic confidence-threshold",
     "dynamic_unmask_threshold": 0.85,
+    "loophole_enabled": False,
 }
 if nfe_values:
     summary.update(

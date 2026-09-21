@@ -8,7 +8,7 @@ Learned Relay Representations for Forward-Thinking Discrete Diffusion Models:
 https://arxiv.org/abs/2605.22967
 
 Run training through a BD3LM entrypoint such as
-``python /nvme-data/neeleshgarg/dllm_fork/examples/a2d/bd3lm/sft.py --help``.
+``python /nvme-data/neeleshgarg/repos/dllm_fork/examples/a2d/bd3lm/sft.py --help``.
 """
 
 from dataclasses import dataclass
