@@ -88,11 +88,14 @@ def _create_bd3lm_attention_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
 @dataclass
 class BD3LMConfig(MDLMConfig):
     block_size: int = 32
+    teacher_loophole_enabled: bool = False
+    teacher_block_size: int | None = None
 
 
 class BD3LMTrainer(MDLMTrainer):
 
     _supports_right_shift_loopholing = True
+    _supports_kl_loopholing = True
 
     def __init__(
         self,
@@ -100,12 +103,32 @@ class BD3LMTrainer(MDLMTrainer):
         *pargs,
         **kwargs,
     ):
+        if args.block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {args.block_size}")
+        if args.teacher_block_size is not None and args.teacher_block_size <= 0:
+            raise ValueError(
+                "teacher_block_size must be positive when provided, got "
+                f"{args.teacher_block_size}"
+            )
+        if args.teacher_loophole_enabled and args.loss_type != "KL":
+            raise ValueError(
+                "teacher_loophole_enabled=True requires loss_type='KL'"
+            )
         if args.loss_type == "CE+KL":
             raise ValueError(
                 "BD3LMTrainer does not support loss_type='CE+KL'. Use 'CE' or 'KL'."
             )
         super().__init__(args=args, *pargs, **kwargs)
         self.block_size = args.block_size
+        self.teacher_loophole_enabled = args.teacher_loophole_enabled
+        self.teacher_block_size = args.teacher_block_size or args.block_size
+        if self.teacher_loophole_enabled and not getattr(
+            getattr(self.ar_model, "config", None), "loophole_enabled", False
+        ):
+            raise ValueError(
+                "teacher_loophole_enabled=True requires a teacher checkpoint with "
+                "config.loophole_enabled=True"
+            )
         # BD3LM intentionally supports CE and KL only.
         self.loss_type_dict = {
             "CE": self.compute_CE_loss,
@@ -173,11 +196,12 @@ class BD3LMTrainer(MDLMTrainer):
             "t": t,
         }
 
-    def _make_student_attention_mask(
+    def _make_bd3lm_attention_mask(
         self,
         model: transformers.PreTrainedModel | nn.Module,
         l: int,
         device: torch.device,
+        block_size: int,
     ):
         # [TODO]: others like flash attention 2
         if self.accelerator.unwrap_model(model).config._attn_implementation == "sdpa":
@@ -186,7 +210,7 @@ class BD3LMTrainer(MDLMTrainer):
                 h=None,
                 q_idx=torch.arange(l * 2, device=device)[:, None],
                 kv_idx=torch.arange(l * 2, device=device)[None, :],
-                block_size=self.block_size,
+                block_size=block_size,
                 n=l,
             )
             attention_mask = (
@@ -201,7 +225,7 @@ class BD3LMTrainer(MDLMTrainer):
             from torch.nn.attention.flex_attention import create_block_mask
 
             return create_block_mask(
-                partial(_create_bd3lm_attention_mask, block_size=self.block_size, n=l),
+                partial(_create_bd3lm_attention_mask, block_size=block_size, n=l),
                 B=None,
                 H=None,
                 Q_LEN=l * 2,
@@ -209,6 +233,19 @@ class BD3LMTrainer(MDLMTrainer):
             )
 
         raise NotImplementedError
+
+    def _make_student_attention_mask(
+        self,
+        model: transformers.PreTrainedModel | nn.Module,
+        l: int,
+        device: torch.device,
+    ):
+        return self._make_bd3lm_attention_mask(
+            model=model,
+            l=l,
+            device=device,
+            block_size=self.block_size,
+        )
 
     def _forward_student(
         self,
@@ -294,7 +331,15 @@ class BD3LMTrainer(MDLMTrainer):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ar_model is None:
-            raise ValueError("KL loss requires an autoregressive model. Pass ar_model to __init__.")
+            raise ValueError(
+                "KL loss requires a teacher model. Pass ar_model to __init__."
+            )
+
+        if getattr(self, "teacher_loophole_enabled", False):
+            return self._forward_loophole_teacher_logits(
+                input_ids=input_ids,
+                noised_input_ids=noised_input_ids,
+            )
 
         with torch.no_grad():
             if self.distillation_policy == "off_policy":
@@ -329,7 +374,79 @@ class BD3LMTrainer(MDLMTrainer):
                     "(e.g., transformers.AutoModelForCausalLM) for KL distillation. "
                     f"Got output type: {type(ar_outputs).__name__}."
                 )
-            return teacher_logits
+            return teacher_logits.to(input_ids.device)
+
+    def _forward_loophole_teacher_logits(
+        self,
+        input_ids: torch.Tensor,
+        noised_input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a frozen Loophole BD3LM teacher twice on the same ``[x_t, x_0]``."""
+        self.ar_model.eval()
+        try:
+            teacher_device = next(self.ar_model.parameters()).device
+        except StopIteration:
+            teacher_device = input_ids.device
+
+        b, l = input_ids.shape
+        concat_input_ids = torch.cat([noised_input_ids, input_ids], dim=1).to(
+            teacher_device
+        )
+        attention_mask = self._make_bd3lm_attention_mask(
+            model=self.ar_model,
+            l=l,
+            device=teacher_device,
+            block_size=getattr(self, "teacher_block_size", self.block_size),
+        )
+        base_pos = torch.arange(l, device=teacher_device).unsqueeze(0).expand(b, l)
+        position_ids = torch.cat([base_pos, base_pos], dim=1)
+
+        with torch.no_grad():
+            pseudo_outputs = self.ar_model(
+                input_ids=concat_input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                loophole_state=None,
+                return_loophole_state=True,
+                loophole_enabled=True,
+                use_cache=False,
+                # Only the hidden state is consumed from this pass.
+                logits_to_keep=1,
+            )
+            loophole_state = getattr(pseudo_outputs, "loophole_state", None)
+            if loophole_state is None:
+                raise RuntimeError(
+                    "The Loophole teacher's pseudo-pass did not return loophole_state"
+                )
+            loophole_state = self._align_loophole_state_for_input(
+                loophole_state.detach()
+            )
+            del pseudo_outputs
+
+            teacher_outputs = self.ar_model(
+                input_ids=concat_input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                loophole_state=loophole_state,
+                return_loophole_state=False,
+                loophole_enabled=True,
+                use_cache=False,
+                # The KL objective only consumes predictions for the x_t stream.
+                logits_to_keep=torch.arange(l, device=teacher_device),
+            )
+            teacher_outputs = self._postprocess_outputs(teacher_outputs)
+            teacher_logits = getattr(teacher_outputs, "logits", None)
+            if teacher_logits is None:
+                raise ValueError(
+                    "The Loophole teacher's second pass returned no logits"
+                )
+            if teacher_logits.shape[:2] != (b, l):
+                raise ValueError(
+                    "The Loophole teacher must return one logit vector per x_t token. "
+                    f"Expected leading shape {(b, l)}, got "
+                    f"{tuple(teacher_logits.shape[:2])}."
+                )
+            return teacher_logits.to(input_ids.device)
 
     def compute_loss(
         self,

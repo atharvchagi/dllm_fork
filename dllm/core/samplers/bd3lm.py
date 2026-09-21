@@ -2,7 +2,7 @@
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 
 Run sampling with
-``python /scratch/user/atharvchagi_tamu.edu/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy
@@ -13,7 +13,11 @@ import torch
 import torch.nn.functional as F
 
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
-from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
+from dllm.core.samplers.utils import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    select_transfer_index,
+)
 
 
 def _prepare_for_sampling(
@@ -88,9 +92,10 @@ def _diffusion_step_block(
     logits: torch.Tensor,  # [B, L, V]
     x_block: torch.Tensor,  # [B, L]
     mask_block: torch.Tensor,  # [B, L] bool
-    num_transfer_step: torch.Tensor,  # [B]
+    minimum_transfer_tokens: torch.Tensor,  # [B]
     temperature: float,
     remasking: str,
+    confidence_threshold: float | None,
 ) -> torch.Tensor:
     """
     One diffusion step over a block slice [B, L].
@@ -107,7 +112,10 @@ def _diffusion_step_block(
 
     # Confidence
     if remasking == "low_confidence":
-        p = F.softmax(logits, dim=-1)
+        confidence_logits = (
+            logits.float() if confidence_threshold is not None else logits
+        )
+        p = F.softmax(confidence_logits, dim=-1)
         x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # [B, L]
     elif remasking == "random":
         x0_p = torch.rand((B, L), device=device)
@@ -119,18 +127,12 @@ def _diffusion_step_block(
     neg_inf = torch.full_like(x0_p, -float("inf"))
     confidence = torch.where(mask_block, x0_p, neg_inf)
 
-    # Pick positions to commit
-    transfer = torch.zeros_like(x0, dtype=torch.bool)  # [B, L]
-    for j in range(B):
-        k = int(num_transfer_step[j].item())
-        if k <= 0:
-            continue
-        valid_count = (confidence[j] > -float("inf")).sum().item()
-        if valid_count == 0:
-            continue
-        k = min(k, valid_count)
-        _, sel = torch.topk(confidence[j], k)
-        transfer[j, sel] = True
+    transfer, _, _ = select_transfer_index(
+        confidence=confidence,
+        candidate_mask=mask_block,
+        minimum_transfer_tokens=minimum_transfer_tokens,
+        confidence_threshold=confidence_threshold,
+    )
 
     x_block_new = x_block.clone()
     x_block_new[transfer] = x0[transfer]
@@ -153,6 +155,7 @@ class BD3LMSamplerConfig(BaseSamplerConfig):
     cfg_keep_tokens: list[int] | None = None
     right_shift_logits: bool = False
     loophole_enabled: bool = False
+    confidence_threshold: float | None = None
 
 
 @dataclass
@@ -243,13 +246,26 @@ class BD3LMSampler(BaseSampler):
             "stochastic_transfer", config.stochastic_transfer
         )
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_history = kwargs.get("return_history", config.return_history)
         right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
         loophole_enabled = kwargs.get(
             "loophole_enabled", config.loophole_enabled
         )
+        confidence_threshold = kwargs.get(
+            "confidence_threshold", config.confidence_threshold
+        )
+
+        if confidence_threshold is not None:
+            if not 0.0 <= confidence_threshold <= 1.0:
+                raise ValueError("confidence_threshold must be between 0 and 1")
+            if remasking != "low_confidence":
+                raise ValueError(
+                    "confidence_threshold requires remasking='low_confidence'"
+                )
 
         assert block_size >= 1
-        assert steps >= 1
+        if confidence_threshold is None:
+            assert steps >= 1
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -312,9 +328,27 @@ class BD3LMSampler(BaseSampler):
 
         # ---- block scheduling ----
         num_blocks = math.ceil(max_new_tokens / block_size)
-        if steps_per_block is None:
+        if confidence_threshold is None and steps_per_block is None:
             steps_per_block = math.ceil(steps / num_blocks)
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_dict and return_history else None
+
+        # NFE is measured from calls actually made by this sampler. Conditional
+        # generation uses one network evaluation per iteration; CFG uses separate
+        # conditional and unconditional evaluations and therefore counts as two.
+        forward_branches = 2 if cfg_scale > 0.0 else 1
+        generated_blocks = 0
+        logical_denoising_iterations = 0
+        prefix_model_forward_calls = 0
+        denoising_model_forward_calls = 0
+        per_sequence_active_denoising_iterations = torch.zeros(
+            B, dtype=torch.long, device=self.model.device
+        )
+        per_sequence_prefix_nfe = torch.zeros(
+            B, dtype=torch.long, device=self.model.device
+        )
+        per_sequence_denoising_nfe = torch.zeros(
+            B, dtype=torch.long, device=self.model.device
+        )
 
         generated = 0  # number of generated tokens so far
 
@@ -402,6 +436,10 @@ class BD3LMSampler(BaseSampler):
                 uncond_prefix_last_logits = None
                 uncond_prefix_last_loophole_state = None
 
+            generated_blocks += 1
+            prefix_model_forward_calls += forward_branches
+            per_sequence_prefix_nfe += forward_branches
+
             # ------------------------------------------------------
             # 2.2) Append new block of mask tokens to the right
             # ------------------------------------------------------
@@ -424,13 +462,19 @@ class BD3LMSampler(BaseSampler):
 
             block_mask_index = x[:, -cur_block_len:] == mask_id  # [B, cur_block_len]
 
-            num_transfer_tokens = get_num_transfer_tokens(
-                mask_index=block_mask_index,
-                steps=steps_per_block,
-                scheduler=self.scheduler,
-                stochastic=stochastic_transfer,
-            )
-            effective_steps = num_transfer_tokens.size(1)
+            if confidence_threshold is None:
+                num_transfer_tokens = get_num_transfer_tokens(
+                    mask_index=block_mask_index,
+                    steps=steps_per_block,
+                    scheduler=self.scheduler,
+                    stochastic=stochastic_transfer,
+                )
+                transfer_schedule = iter(num_transfer_tokens.unbind(dim=1))
+            else:
+                # Threshold mode has no fixed step budget or transfer schedule.
+                # Every active sequence transfers at least its most-confident
+                # remaining token, so the dynamic loop terminates naturally.
+                transfer_schedule = None
 
             # Full attention mask + pos for prefix + current block
             full_attention_mask, full_position_ids = _prepare_for_sampling(
@@ -454,12 +498,32 @@ class BD3LMSampler(BaseSampler):
             # ======================================================
             # 3) Inner diffusion loop within the current block
             # ======================================================
-            for i_step in range(effective_steps):
+            while True:
                 x_block = x[:, T_prefix:T_total]  # [B, cur_block_len]
                 mask_block = x_block == mask_id
 
                 if not mask_block.any():
                     break
+
+                if transfer_schedule is None:
+                    minimum_transfer_tokens = torch.ones(
+                        B_cur,
+                        dtype=torch.long,
+                        device=self.model.device,
+                    )
+                else:
+                    minimum_transfer_tokens = next(transfer_schedule, None)
+                    if minimum_transfer_tokens is None:
+                        break
+
+                # Every row is evaluated while the batch has any masks left.
+                # Track active iterations separately so batched runs can expose
+                # both useful denoising work and the model calls actually made.
+                active_sequences = mask_block.any(dim=1)
+                logical_denoising_iterations += 1
+                denoising_model_forward_calls += forward_branches
+                per_sequence_active_denoising_iterations += active_sequences.long()
+                per_sequence_denoising_nfe += forward_branches
 
                 # ---- Conditional logits for current block ----
                 cond_logits_block, cond_loophole_state = self._forward_block(
@@ -515,9 +579,10 @@ class BD3LMSampler(BaseSampler):
                     logits=logits_block,
                     x_block=x_block,
                     mask_block=mask_block,
-                    num_transfer_step=num_transfer_tokens[:, i_step],
+                    minimum_transfer_tokens=minimum_transfer_tokens,
                     temperature=temperature,
                     remasking=remasking,
+                    confidence_threshold=confidence_threshold,
                 )
 
                 # Write back
@@ -539,7 +604,39 @@ class BD3LMSampler(BaseSampler):
         if not return_dict:
             return x
         else:
-            return BaseSamplerOutput(sequences=x, histories=histories)
+            per_sequence_total_nfe = (
+                per_sequence_prefix_nfe + per_sequence_denoising_nfe
+            )
+            generation_stats = {
+                "schema_version": 1,
+                "batch_size": B,
+                "generated_blocks": generated_blocks,
+                "logical_denoising_iterations": logical_denoising_iterations,
+                "prefix_model_forward_calls": prefix_model_forward_calls,
+                "denoising_model_forward_calls": denoising_model_forward_calls,
+                "total_model_forward_calls": (
+                    prefix_model_forward_calls + denoising_model_forward_calls
+                ),
+                "per_sequence_active_denoising_iterations": (
+                    per_sequence_active_denoising_iterations.detach().cpu().tolist()
+                ),
+                "per_sequence_prefix_nfe": (
+                    per_sequence_prefix_nfe.detach().cpu().tolist()
+                ),
+                "per_sequence_denoising_nfe": (
+                    per_sequence_denoising_nfe.detach().cpu().tolist()
+                ),
+                "per_sequence_total_nfe": (
+                    per_sequence_total_nfe.detach().cpu().tolist()
+                ),
+                "cfg_scale": cfg_scale,
+                "loophole_enabled": loophole_enabled,
+            }
+            return BaseSamplerOutput(
+                sequences=x,
+                histories=histories,
+                generation_stats=generation_stats,
+            )
 
     @torch.no_grad()
     def infill(

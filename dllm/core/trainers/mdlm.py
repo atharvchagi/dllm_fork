@@ -41,6 +41,7 @@ class MDLMConfig(TrainingArguments):
 class MDLMTrainer(transformers.Trainer):
 
     _supports_right_shift_loopholing = False
+    _supports_kl_loopholing = False
 
     def __init__(
         self,
@@ -63,7 +64,11 @@ class MDLMTrainer(transformers.Trainer):
                 "Loopholing does not yet support right_shift_logits=True because "
                 "the recurrent state would require an explicit positional shift."
             )
-        if args.loophole_enabled and args.loss_type != "CE":
+        if (
+            args.loophole_enabled
+            and args.loss_type != "CE"
+            and not self._supports_kl_loopholing
+        ):
             raise ValueError(
                 "Loopholing currently supports only loss_type='CE'; KL and CE+KL "
                 "remain on the baseline single-pass path."
@@ -167,6 +172,10 @@ class MDLMTrainer(transformers.Trainer):
             loophole_state = self._align_loophole_state_for_input(
                 loophole_state.detach()
             )
+            # The pseudo-pass logits are not part of the loss. Drop the output
+            # container before the loss-bearing pass so long-sequence training does
+            # not retain a full extra [batch, sequence, vocabulary] tensor.
+            del pseudo_outputs
 
         return model(
             input_ids=input_ids,

@@ -1,6 +1,71 @@
+"""Shared diffusion-sampling helpers.
+
+Run these helpers through an absolute pipeline entrypoint such as
+``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+"""
+
 import torch
 
 from dllm.core.schedulers import BaseAlphaScheduler
+
+
+def select_transfer_index(
+    confidence: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    minimum_transfer_tokens: torch.Tensor,
+    confidence_threshold: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select threshold-qualified tokens with a per-sequence progress floor."""
+    batch_size = confidence.shape[0]
+    transfer_index = torch.zeros_like(candidate_mask)
+    threshold_accepted = torch.zeros(
+        batch_size,
+        dtype=torch.long,
+        device=confidence.device,
+    )
+    below_threshold_fallback = torch.zeros_like(threshold_accepted)
+
+    for row in range(batch_size):
+        masked_count = int(candidate_mask[row].sum().item())
+        minimum_count = min(
+            int(minimum_transfer_tokens[row].item()),
+            masked_count,
+        )
+        if masked_count == 0:
+            continue
+
+        if confidence_threshold is not None:
+            high_confidence = candidate_mask[row] & (
+                confidence[row] >= confidence_threshold
+            )
+            transfer_index[row] = high_confidence
+            accepted_count = int(high_confidence.sum().item())
+            threshold_accepted[row] = accepted_count
+            fallback_count = max(0, minimum_count - accepted_count)
+            if fallback_count > 0:
+                fallback_confidence = torch.where(
+                    candidate_mask[row] & ~high_confidence,
+                    confidence[row],
+                    -torch.inf,
+                )
+                _, selected = torch.topk(
+                    fallback_confidence,
+                    k=fallback_count,
+                )
+                transfer_index[row, selected] = True
+                below_threshold_fallback[row] = fallback_count
+            continue
+
+        if minimum_count > 0:
+            candidate_confidence = torch.where(
+                candidate_mask[row],
+                confidence[row],
+                -torch.inf,
+            )
+            _, selected = torch.topk(candidate_confidence, k=minimum_count)
+            transfer_index[row, selected] = True
+
+    return transfer_index, threshold_accepted, below_threshold_fallback
 
 
 def get_num_transfer_tokens(
