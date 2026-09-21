@@ -2,7 +2,7 @@
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 
 Run sampling with
-``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+``python /home/ngarg2/repos/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy

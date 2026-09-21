@@ -1,7 +1,7 @@
 {
   "model": "Qwen/Qwen3-0.6B",
-  "result_file": "/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/20260912_221231/results_2026-09-12T22-17-26.975514.json",
-  "sample_file": "/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/20260912_221231/samples_gsm8k_cot_2026-09-12T22-17-26.975514.jsonl",
+  "result_file": "/nvme-data/neeleshgarg/repos/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/20260912_221231/results_2026-09-12T22-17-26.975514.json",
+  "sample_file": "/nvme-data/neeleshgarg/repos/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/20260912_221231/samples_gsm8k_cot_2026-09-12T22-17-26.975514.jsonl",
   "metrics": {
     "alias": "gsm8k_cot",
     "exact_match,strict-match": 0.0,
@@ -65,7 +65,7 @@
     "Different checkpoints and response lengths: this compares evaluation paths, not isolated kernel speed."
   ],
   "relay_comparison": {
-    "result_file": "/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_bd3lm_block4_k2_gsm8k/throughput_random32/dynamic/len2048/20260912_215356/results_2026-09-12T21-53-56.255468.json",
+    "result_file": "/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/5ep/throughput_random32/dynamic/len2048/20260912_215356/results_2026-09-12T21-53-56.255468.json",
     "output_tokens_per_second": 32.235018459390986,
     "qwen_to_relay_throughput_ratio": 0.720295887032375
   }

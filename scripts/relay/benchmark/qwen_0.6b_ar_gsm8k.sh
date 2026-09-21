@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 
-# Run: bash /nvme-data/neeleshgarg/dllm_fork/scripts/relay/benchmark/qwen_0.6b_ar_gsm8k.sh
+# Run: bash /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/qwen_0.6b_ar_gsm8k.sh
 
 set -euo pipefail
 
 source /home/ngarg2/miniforge3/etc/profile.d/conda.sh
 conda activate /nvme-data/neeleshgarg/envs/dllm
 
-cd /nvme-data/neeleshgarg/dllm_fork
+cd /nvme-data/neeleshgarg/repos/dllm_fork
 # Use the same local lm-eval version as the Relay benchmark.
-export PYTHONPATH="/nvme-data/neeleshgarg/dllm_fork/lm-evaluation-harness${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="/nvme-data/neeleshgarg/repos/dllm_fork/lm-evaluation-harness${PYTHONPATH:+:${PYTHONPATH}}"
 export WANDB_MODE=disabled
 
-checkpoint=/nvme-data/neeleshgarg/dllm_fork/.models/Qwen/Qwen3-0.6B
-result_dir=/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/$(date +%Y%m%d_%H%M%S)
-relay_results=/nvme-data/neeleshgarg/dllm_fork/results/qwen_0.6b_bd3lm_block4_k2_gsm8k/throughput_random32/dynamic/len2048
+checkpoint=/nvme-data/neeleshgarg/repos/dllm_fork/.models/Qwen/Qwen3-0.6b
+result_dir=/nvme-data/neeleshgarg/repos/dllm_fork/results/qwen_0.6b_ar_gsm8k/throughput_random32/len2048/$(date +%Y%m%d_%H%M%S)
+relay_results=/nvme-data/neeleshgarg/repos/dllm_fork/results/relay/qwen_0.6b_bd3lm_block4_k2_gsm8k/5ep/throughput_random32/dynamic/len2048
 sample_selection='{"gsm8k_cot":[13,51,54,61,65,178,191,209,228,285,318,326,407,447,451,457,476,501,563,569,696,859,864,865,919,1034,1116,1149,1206,1209,1232,1309]}'
 
 mkdir -p "${result_dir}"
@@ -132,4 +132,4 @@ print(json.dumps(summary, indent=2))
 print(f"Wrote {summary_path.resolve()}")
 PY
 
-python /nvme-data/neeleshgarg/dllm_fork/scripts/relay/benchmark/summarize_throughput.py
+python /nvme-data/neeleshgarg/repos/dllm_fork/scripts/relay/benchmark/summarize_throughput.py
