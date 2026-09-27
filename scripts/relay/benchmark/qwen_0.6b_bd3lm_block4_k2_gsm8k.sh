@@ -53,7 +53,7 @@ CUDA_VISIBLE_DEVICES="${gpu_id}" WANDB_MODE=disabled \
   --batch_size 1 \
   --samples "${sample_selection}" \
   --loophole_enabled \
-  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=${max_length},block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
+  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=${max_length},block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_enabled=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
   --output_path "${result_dir}" \
   --log_samples 2>&1 | tee "${log_file}"
 

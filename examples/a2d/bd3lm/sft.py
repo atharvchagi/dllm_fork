@@ -1,6 +1,6 @@
 """Train a BD3LM model with SFT data.
 
-Run ``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sft.py --help``
+Run ``python /home/ngarg2/repos/dllm_fork/examples/a2d/bd3lm/sft.py --help``
 after activating the ``dllm`` conda environment.
 """
 
@@ -80,6 +80,7 @@ def train():
         # This adds a zero-initialized Loophole adapter when the initialization
         # checkpoint is the ordinary qwen-a2d model.
         student_config.loophole_enabled = True
+        student_config.relay_enabled = training_args.loss_type == "BPTT"
     model = dllm.utils.get_model(model_args=model_args, config=student_config)
     teacher_model = None
     if training_args.loss_type == "KL":
@@ -255,7 +256,7 @@ def train():
         trainer.save_metrics("eval", metrics)
         return metrics
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(training_args.output_dir)
     trainer.processing_class.save_pretrained(training_args.output_dir)
 

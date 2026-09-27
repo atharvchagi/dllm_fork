@@ -45,11 +45,17 @@ class LoopholeLayerNorm(nn.LayerNorm):
 class A2DQwen3Config(transformers.Qwen3Config):
     model_type = "a2d-qwen3"  # <- NEW model_type
 
-    def __init__(self, loophole_enabled: bool = False, **kwargs):
+    def __init__(
+        self,
+        loophole_enabled: bool = False,
+        relay_enabled: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         # This is an architecture capability flag and is serialized with checkpoints.
         # Individual trainer/sampler calls still opt into the recurrent path explicitly.
         self.loophole_enabled = loophole_enabled
+        self.relay_enabled = relay_enabled
 
 
 class A2DQwen3Model(transformers.Qwen3Model):

@@ -2,7 +2,7 @@
 
 The [training launcher](/home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/train.sh) starts from a local copy of `divelab/Qwen3-0.6B-a2d-init` and fine-tunes on the full `openai/gsm8k` train split. Each block size (8, 16, 32) gets a separate checkpoint. The loss is CE, Loophole is off, and the other training settings are identical: four GPUs, batch size 8 per GPU, gradient accumulation 1 (effective batch 32), five epochs, learning rate `1e-4`, and training sequence length 1024. Training does not score the test split.
 
-The [evaluation launcher](/home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval.sh) scores the final checkpoint on the full GSM8K test split using `gsm8k_cot`, zero-shot chat formatting, 256 generated tokens, 256 denoising steps, and the matching block size. Results are saved under `/home/ngarg2/repos/dllm_fork/results/gsm8k_baseline/`. Training and evaluation log to the `gsm8k-bd3lm-baseline` W&B project by default.
+The [evaluation launcher](/home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval.sh) scores the final checkpoint on the full GSM8K test split using `gsm8k_cot`, zero-shot chat formatting, 256 generated tokens, 256 denoising steps, batch size 1 per GPU, and the matching block size. The block-specific launchers use disjoint, hardware-matched groups of four GPUs by UUID and refuse to start if one is occupied. Results and end-to-end throughput summaries are saved under `/home/ngarg2/repos/dllm_fork/results/gsm8k_baseline/`. Training and evaluation log to the `gsm8k-bd3lm-baseline` W&B project by default.
 
 First, download the model once on the login node, without requesting a GPU. The account currently has no `~/.zshrc`, so use the Miniforge conda hook:
 
@@ -30,4 +30,17 @@ bash /home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval.sh 16
 bash /home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval.sh 32
 ```
 
-Each launcher finds the repository from its own location and uses `CUDA_VISIBLE_DEVICES=3,4,5,6` by default; set `DLLM_GPUS` to use another four GPU indices. It activates `/home/ngarg2/miniforge3/envs/dllm` by default; set `DLLM_CONDA_ENV` and `DLLM_CONDA_HOOK` if needed. Download the model into that checkout's `.models/Qwen0.6b/a2d-init` directory before training; model weights are ignored by this clone's private Git exclude file. Training writes checkpoints under that checkout's `.models/gsm8k_baseline/`. Run `wandb login` in the `dllm` environment before starting if this account is not logged in; set `WANDB_MODE=disabled` if W&B logging is unwanted.
+To evaluate block sizes 8 and 16 concurrently, run these commands in separate tmux sessions:
+
+```bash
+bash /home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval_block8_4gpu.sh
+bash /home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval_block16_4gpu.sh
+```
+
+To evaluate block size 32 with the same batch-one setup and the same physical GPU group used for block 16:
+
+```bash
+bash /home/ngarg2/repos/dllm_fork/scripts/gsm8k_baseline/eval_block32_4gpu.sh
+```
+
+Each launcher finds the repository from its own location. Block 8 uses physical GPUs 1, 2, 3, and 7; block 16 uses physical GPUs 4, 5, 6, and 8. Each group contains three RTX 6000 Ada GPUs and one RTX A6000. It activates `/home/ngarg2/miniforge3/envs/dllm` by default; set `DLLM_CONDA_ENV` and `DLLM_CONDA_HOOK` if needed. Download the model into that checkout's `.models/Qwen0.6b/a2d-init` directory before training; model weights are ignored by this clone's private Git exclude file. Training keeps one full checkpoint at the halfway point, including optimizer, scheduler, and RNG state. Restarting the launcher resumes from that checkpoint automatically. After successful completion, it removes intermediate checkpoints and keeps the final model under that checkout's `.models/gsm8k_baseline/`. Run `wandb login` in the `dllm` environment before starting if this account is not logged in; set `WANDB_MODE=disabled` if W&B logging is unwanted.

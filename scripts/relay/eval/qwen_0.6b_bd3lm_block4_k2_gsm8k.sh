@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
   --num_fewshot 0 \
   --batch_size 4 \
   --loophole_enabled \
-  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=2048,block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
+  --model_args "pretrained=${checkpoint},max_new_tokens=0,max_length=2048,block_size=4,cfg_scale=0.0,temperature=0.0,right_shift_logits=True,relay_enabled=True,relay_unmask_threshold=0.85,nfe_output_path=${nfe_file}" \
   --output_path "${result_dir}" \
   --wandb_args "project=block-relay,name=bd3lm-relay-block4-k2-${model_epochs}ep-gsm8k-dynamic-2048-eval,job_type=eval" \
   --wandb_config_args "block_size=4,relay_steps=2,max_length=2048,decoding=dynamic,relay_unmask_threshold=0.85,num_gpus=8,model_epochs=${model_epochs}" \
