@@ -422,6 +422,7 @@ class _BD3LMSamplerLoopholeLM(nn.Module):
         past_key_values=None,
         use_cache=None,
         loophole_state=None,
+        loophole_mask=None,
         return_loophole_state=False,
         loophole_enabled=None,
     ):
@@ -432,6 +433,7 @@ class _BD3LMSamplerLoopholeLM(nn.Module):
             {
                 "is_prefix": is_prefix,
                 "loophole_state": loophole_state,
+                "loophole_mask": loophole_mask,
                 "return_loophole_state": return_loophole_state,
                 "loophole_enabled": loophole_enabled,
             }
@@ -572,6 +574,35 @@ def test_bd3lm_sampler_aligns_loophole_state_for_a2d_right_shift():
     assert block_calls[0]["loophole_state"] is None
     expected_state = torch.tensor([[[-1.0] * 4, [1.0] * 4]])
     assert torch.equal(block_calls[1]["loophole_state"], expected_state)
+
+
+def test_bd3lm_relay_sampler_injects_state_only_at_masked_tokens():
+    model = _BD3LMSamplerLoopholeLM()
+    tokenizer = SimpleNamespace(
+        mask_token_id=7,
+        bos_token_id=1,
+        pad_token_id=0,
+        eos_token_id=6,
+    )
+    sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
+
+    sampler.sample(
+        inputs=[[1]],
+        config=BD3LMSamplerConfig(
+            max_new_tokens=2,
+            block_size=2,
+            steps=2,
+            loophole_enabled=True,
+            relay_enabled=True,
+        ),
+    )
+
+    prefix_calls = [call for call in model.calls if call["is_prefix"]]
+    block_calls = [call for call in model.calls if not call["is_prefix"]]
+    assert all(call["loophole_mask"] is None for call in prefix_calls)
+    assert all(call["loophole_mask"] is not None for call in block_calls)
+    assert all(call["loophole_mask"].dtype == torch.bool for call in block_calls)
+    assert block_calls[0]["loophole_mask"].all()
 
 
 def test_sampler_returns_entropy_for_each_masked_generation_step():

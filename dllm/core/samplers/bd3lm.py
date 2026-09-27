@@ -2,12 +2,15 @@
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 
 Run sampling with
-``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
+``python /home/ngarg2/repos/dllm_fork/examples/a2d/bd3lm/sample.py --help``.
 """
 
 import copy
+import hashlib
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -155,7 +158,10 @@ class BD3LMSamplerConfig(BaseSamplerConfig):
     cfg_keep_tokens: list[int] | None = None
     right_shift_logits: bool = False
     loophole_enabled: bool = False
+    relay_enabled: bool | None = None
     confidence_threshold: float | None = None
+    relay_unmask_threshold: float | None = None
+    nfe_output_path: str | None = None
 
 
 @dataclass
@@ -169,6 +175,7 @@ class BD3LMSampler(BaseSampler):
         past_key_values,
         loophole_state: torch.Tensor | None,
         loophole_enabled: bool,
+        relay_enabled: bool,
         right_shift_logits: bool,
         prefix_last_loophole_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -184,12 +191,16 @@ class BD3LMSampler(BaseSampler):
             outputs = self.model(**model_kwargs)
             return outputs.logits, None
 
-        outputs = self.model(
-            **model_kwargs,
-            loophole_state=loophole_state,
-            return_loophole_state=True,
-            loophole_enabled=True,
-        )
+        loophole_kwargs = {
+            "loophole_state": loophole_state,
+            "return_loophole_state": True,
+            "loophole_enabled": True,
+        }
+        if relay_enabled:
+            loophole_kwargs["loophole_mask"] = (
+                input_ids == self.tokenizer.mask_token_id
+            )
+        outputs = self.model(**model_kwargs, **loophole_kwargs)
         next_state = getattr(outputs, "loophole_state", None)
         if next_state is None:
             raise RuntimeError(
@@ -251,9 +262,30 @@ class BD3LMSampler(BaseSampler):
         loophole_enabled = kwargs.get(
             "loophole_enabled", config.loophole_enabled
         )
+        relay_enabled = kwargs.get("relay_enabled", config.relay_enabled)
+        if relay_enabled is None:
+            relay_enabled = bool(
+                getattr(getattr(self.model, "config", None), "relay_enabled", False)
+            )
+        if relay_enabled and not loophole_enabled:
+            raise ValueError("relay_enabled=True requires loophole_enabled=True")
         confidence_threshold = kwargs.get(
             "confidence_threshold", config.confidence_threshold
         )
+        relay_unmask_threshold = kwargs.get(
+            "relay_unmask_threshold", config.relay_unmask_threshold
+        )
+        if confidence_threshold is None:
+            confidence_threshold = relay_unmask_threshold
+        elif (
+            relay_unmask_threshold is not None
+            and relay_unmask_threshold != confidence_threshold
+        ):
+            raise ValueError(
+                "confidence_threshold and relay_unmask_threshold must match when "
+                "both are provided"
+            )
+        nfe_output_path = kwargs.get("nfe_output_path", config.nfe_output_path)
 
         if confidence_threshold is not None:
             if not 0.0 <= confidence_threshold <= 1.0:
@@ -533,6 +565,7 @@ class BD3LMSampler(BaseSampler):
                     past_key_values=copy.deepcopy(cond_past),
                     loophole_state=cond_loophole_state,
                     loophole_enabled=loophole_enabled,
+                    relay_enabled=relay_enabled,
                     right_shift_logits=right_shift_logits,
                     prefix_last_loophole_state=cond_prefix_last_loophole_state,
                 )  # [B, cur_block_len, V]
@@ -548,6 +581,7 @@ class BD3LMSampler(BaseSampler):
                         past_key_values=copy.deepcopy(uncond_past),
                         loophole_state=uncond_loophole_state,
                         loophole_enabled=loophole_enabled,
+                        relay_enabled=relay_enabled,
                         right_shift_logits=right_shift_logits,
                         prefix_last_loophole_state=(
                             uncond_prefix_last_loophole_state
@@ -598,6 +632,35 @@ class BD3LMSampler(BaseSampler):
 
             generated += cur_block_len
 
+        if nfe_output_path is not None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            base_path = Path(nfe_output_path)
+            rank_path = base_path.with_name(
+                f"{base_path.stem}.rank{rank}{base_path.suffix}"
+            )
+            rank_path.parent.mkdir(parents=True, exist_ok=True)
+            initialized_paths = getattr(self, "_initialized_nfe_paths", set())
+            mode = "a" if rank_path in initialized_paths else "w"
+            with rank_path.open(mode, encoding="utf-8") as handle:
+                active_nfe = per_sequence_active_denoising_iterations.tolist()
+                for prompt, nfe in zip(inputs, active_nfe):
+                    prompt_ids = (
+                        prompt.tolist() if isinstance(prompt, torch.Tensor) else prompt
+                    )
+                    prompt_hash = hashlib.sha256(
+                        json.dumps(prompt_ids, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    handle.write(
+                        json.dumps({"prompt_sha256": prompt_hash, "nfe": nfe})
+                        + "\n"
+                    )
+            initialized_paths.add(rank_path)
+            self._initialized_nfe_paths = initialized_paths
+
         # ==========================================================
         # 4) Output
         # ==========================================================
@@ -631,6 +694,7 @@ class BD3LMSampler(BaseSampler):
                 ),
                 "cfg_scale": cfg_scale,
                 "loophole_enabled": loophole_enabled,
+                "relay_enabled": relay_enabled,
             }
             return BaseSamplerOutput(
                 sequences=x,
