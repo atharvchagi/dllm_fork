@@ -18,6 +18,7 @@ class BaseSamplerOutput:
     sequences: torch.Tensor
     histories: list[torch.Tensor] | None = None
     step_metrics: list[dict[str, torch.Tensor | int]] | None = None
+    generation_stats: dict[str, object] | None = None
 
 
 @dataclass

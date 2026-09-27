@@ -1,29 +1,7 @@
-"""
-Local users
-------------
-- 1 GPU:
-    accelerate launch \
-        --config_file scripts/accelerate_configs/ddp.yaml --num_processes 1 \
-        examples/a2d/bd3lm/sft.py
+"""Train a BD3LM model with SFT data.
 
-- 8 GPUs (ZeRO-2):
-    accelerate launch \
-        --config_file scripts/accelerate_configs/zero2.yaml \
-        examples/a2d/bd3lm/sft.py
-
-Slurm users
-# Note: run `mkdir .logs` before running sbatch; and adjust
-#       `partition` and `quotatype` in `scripts/train.slurm.sh` for your cluster.
-------------
-- 1 Node, 8 GPUs (ZeRO-2):
-    sbatch --gres=gpu:8 scripts/train.slurm.sh \
-        --accelerate_config "zero2" \
-        --script_path "examples/a2d/bd3lm/sft.py"
-
-- 2 Nodes, 16 GPUs (ZeRO-2):
-    sbatch --nodes=2 --gres=gpu:8 scripts/train.slurm.sh \
-        --accelerate_config "zero2" \
-        --script_path "examples/a2d/bd3lm/sft.py"
+Run ``python /nvme-data2/atharvchagi/dllm_fork/examples/a2d/bd3lm/sft.py --help``
+after activating the ``dllm`` conda environment.
 """
 
 import os
@@ -87,35 +65,89 @@ def train():
     dllm.utils.initial_training_setup(model_args, data_args, training_args)
 
     # ----- Model ------------------------------------------------------------------
-    model = dllm.utils.get_model(model_args=model_args)
+    student_config = None
+    if training_args.loophole_enabled:
+        student_config = transformers.AutoConfig.from_pretrained(
+            model_args.model_name_or_path
+        )
+        if not isinstance(student_config, dllm.pipelines.a2d.A2DQwen3Config):
+            raise ValueError(
+                "--loophole_enabled currently requires an A2D Qwen3 checkpoint"
+            )
+        # This adds a zero-initialized Loophole adapter when the initialization
+        # checkpoint is the ordinary qwen-a2d model.
+        student_config.loophole_enabled = True
+    model = dllm.utils.get_model(model_args=model_args, config=student_config)
     teacher_model = None
     if training_args.loss_type == "KL":
         if model_args.teacher_model_name_or_path is None:
             raise ValueError(
-                "--teacher_model_name_or_path is required when --loss_type KL for BD3LM."
+                "--teacher_model_name_or_path is required when --loss_type KL "
+                "for BD3LM."
             )
         teacher_model_name_or_path = dllm.utils.resolve_with_base_env(
             model_args.teacher_model_name_or_path,
             "BASE_MODELS_DIR",
         )
 
+        teacher_config = transformers.AutoConfig.from_pretrained(
+            teacher_model_name_or_path
+        )
+        if training_args.teacher_loophole_enabled:
+            if not isinstance(
+                teacher_config, dllm.pipelines.a2d.A2DQwen3Config
+            ):
+                raise ValueError(
+                    "--teacher_loophole_enabled requires an A2D Qwen3 teacher"
+                )
+            if not getattr(teacher_config, "loophole_enabled", False):
+                raise ValueError(
+                    "--teacher_loophole_enabled requires a checkpoint whose "
+                    "config.loophole_enabled is true"
+                )
+
         teacher_kwargs = {
-            "torch_dtype": getattr(torch, model_args.teacher_dtype),
+            "dtype": getattr(torch, model_args.teacher_dtype),
             "attn_implementation": model_args.teacher_attn_implementation,
+            "config": teacher_config,
         }
         if torch.cuda.is_available():
             teacher_kwargs["device_map"] = {
                 "": accelerate.PartialState().local_process_index
             }
-    
-        teacher_model = transformers.AutoModelForCausalLM.from_pretrained(
+        if model_args.teacher_load_in_4bit:
+            if not transformers.utils.is_bitsandbytes_available():
+                raise RuntimeError(
+                    "--teacher_load_in_4bit requires bitsandbytes"
+                )
+            teacher_kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=getattr(torch, model_args.teacher_dtype),
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+        teacher_cls = (
+            dllm.pipelines.a2d.A2DQwen3LMHeadModel
+            if training_args.teacher_loophole_enabled
+            else transformers.AutoModelForCausalLM
+        )
+        teacher_model = teacher_cls.from_pretrained(
             teacher_model_name_or_path,
             **teacher_kwargs,
         )
+        teacher_model.requires_grad_(False)
         teacher_model.eval()
+        if model.config.vocab_size != teacher_model.config.vocab_size:
+            raise ValueError(
+                "Teacher and student vocabularies must match for KL distillation: "
+                f"student={model.config.vocab_size}, "
+                f"teacher={teacher_model.config.vocab_size}"
+            )
     elif training_args.loss_type == "CE+KL":
         raise ValueError(
-            "BD3LM does not support --loss_type CE+KL. Use --loss_type CE or --loss_type KL."
+            "BD3LM does not support --loss_type CE+KL. Use --loss_type CE or "
+            "--loss_type KL."
         )
 
     # ----- Tokenizer --------------------------------------------------------------
@@ -141,7 +173,10 @@ def train():
             data_args.dataset_args,
             load_preprocessed_data=data_args.load_preprocessed_data,
         )
-        dataset = _map_and_postprocess(ds=dataset, mask_prompt_loss=data_args.mask_prompt_loss)
+        dataset = _map_and_postprocess(
+            ds=dataset,
+            mask_prompt_loss=data_args.mask_prompt_loss,
+        )
 
         eval_dataset = dataset.get("test", None)
         if data_args.eval_dataset_args:
