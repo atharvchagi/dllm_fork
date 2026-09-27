@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/home/ngarg2/repos/dllm_fork/.models/gsm8k_baseline/bd3lm_block8",
+  "result_file": "/home/ngarg2/repos/dllm_fork/results/gsm8k_baseline/bd3lm_block8/batch1_4gpu/20260923_141236/__home__ngarg2__repos__dllm_fork__.models__gsm8k_baseline__bd3lm_block8/results_2026-09-23T14-36-36.987581.json",
+  "metrics": {
+    "alias": "gsm8k_cot",
+    "exact_match,strict-match": 0.0,
+    "exact_match_stderr,strict-match": 0.0,
+    "exact_match,flexible-extract": 0.28658074298711145,
+    "exact_match_stderr,flexible-extract": 0.012454841668337695
+  },
+  "total_evaluation_time_seconds": 1433.0333744529635,
+  "evaluated_samples": 1319,
+  "aggregate_samples_per_second": 0.9204251788647324,
+  "normalized_samples_per_second_per_gpu": 0.2301062947161831,
+  "generated_tokens": 147306,
+  "mean_generated_tokens_per_sample": 111.6800606520091,
+  "aggregate_output_tokens_per_second": 102.79313980124964,
+  "normalized_output_tokens_per_second_per_gpu": 25.69828495031241,
+  "num_gpus": 4,
+  "gpu_uuids": [
+    "GPU-43f0c2b4-d013-b88a-6595-12ce7fe4ab98",
+    "GPU-cb79cdce-7f85-fe4f-6d63-3a0abc3e3929",
+    "GPU-af4a1b59-58a5-af18-bdc9-0bf62e636634",
+    "GPU-ed6fa8a2-6c94-71dd-60f7-496a84b424bc"
+  ],
+  "batch_size_per_gpu": 1,
+  "global_concurrent_batch_size": 4,
+  "block_size": 8,
+  "max_new_tokens": 256,
+  "denoising_steps": 256,
+  "decoding": "static deterministic",
+  "throughput_scope": "four-GPU end-to-end lm-eval wall time, including model loading, generation, and scoring"
+}
