@@ -1,0 +1,27 @@
+{
+  "ppl": {
+    "mode": "ppl",
+    "algorithm": "udlm",
+    "checkpoint": "/home/ngarg2/repos/dllm_fork/.models/UDLM/udlm_owt_1M.ckpt",
+    "dataset_config": "openwebtext-split",
+    "validation_dataset": "openwebtext-valid",
+    "batch_size": 1,
+    "sequence_length": 1024,
+    "warmup_batches": 1,
+    "requested_batches": "all",
+    "batches": 110473,
+    "monte_carlo_samples_per_batch": 1,
+    "tokens": 113124352,
+    "nll": 3.2459203212353414,
+    "bits_per_token": 4.682873150566938,
+    "perplexity": 25.68533794788753,
+    "model_seconds": 1554.1812009268906,
+    "end_to_end_evaluation_seconds": 2682.9127929309616,
+    "dataset_sequences_per_second": 71.0811583193231,
+    "dataset_tokens_per_second": 72787.10611898685,
+    "throughput_timing_scope": "CUDA-synchronized LDDM-U NLL calls on held-out dataset sequences; excludes loading, tokenization, transfers, warmup, and diagnostic accuracy.",
+    "denoising_token_accuracy": 0.4493968902469382,
+    "denoising_accuracy_tokens": 113124352,
+    "denoising_accuracy_note": "Random-time clean-token recovery diagnostic; this is not a paper task-accuracy metric."
+  }
+}
